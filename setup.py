@@ -20,6 +20,7 @@ build_exe_options = {
     ],
     "include_files": [
         ("assets/spinner.gif", "assets/spinner.gif"),
+        ("assets/HydraDragonAV.ico", "assets/HydraDragonAV.ico"),
     ],
     "excludes": ["tkinter"],  # Exclude unnecessary packages to reduce package size.
 }

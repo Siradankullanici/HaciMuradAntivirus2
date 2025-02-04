@@ -1,5 +1,6 @@
 import os
 import sys
+import shutil
 import hashlib
 import mimetypes
 import requests
@@ -7,7 +8,7 @@ import time
 import re
 import logging
 
-# Windows API for monitoring
+# Windows API for directory monitoring.
 import win32file
 import win32con
 
@@ -15,10 +16,11 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QPushButton, QFileDialog,
     QListWidget, QLabel, QMessageBox, QHBoxLayout, QProgressBar, QGroupBox, QGridLayout
 )
-from PySide6.QtCore import QThread, Signal, Qt, QMutex, QWaitCondition
-from PySide6.QtGui import QMovie
+from PySide6.QtCore import QThread, Signal, Qt, QMutex, QWaitCondition, QUrl
+from PySide6.QtGui import QMovie, QIcon
+from PySide6.QtGui import QDesktopServices
 
-# For desktop notifications
+# For desktop notifications.
 from notifypy import Notify
 
 # ----------------- Antivirus Style Sheet -----------------
@@ -176,23 +178,29 @@ def notify_user(file_path, virus_name=""):
     notification = Notify()
     notification.title = "Malware Alert"
     if virus_name:
-        notification.message = f"Malicious file detected:\n{file_path}\nVirus: {virus_name}"
+        notification.message = f"Malicious file quarantined:\n{file_path}\nVirus: {virus_name}"
     else:
-        notification.message = f"Malicious file detected:\n{file_path}"
+        notification.message = f"Malicious file quarantined:\n{file_path}"
     notification.send()
 
-def scan_and_remove_warn(file_path):
+def scan_and_quarantine(file_path):
     """
-    Scans the file and auto-removes it if malware is detected.
+    Scans the file and, if malicious, auto-quarantines it.
+    A file is considered malicious in this demo if its name contains '.mal'.
+    It is moved to a quarantine folder in the current script directory.
     Returns a tuple (is_malware, virus_name).
-    For demonstration, any file with '.mal' in its name is considered malicious.
     """
     if ".mal" in file_path.lower():
+        quarantine_folder = os.path.join(os.getcwd(), "quarantine")
+        if not os.path.exists(quarantine_folder):
+            os.makedirs(quarantine_folder)
+        base_name = os.path.basename(file_path)
+        quarantine_path = os.path.join(quarantine_folder, base_name)
         try:
-            os.remove(file_path)
-            logging.info(f"Malicious file removed: {file_path}")
+            shutil.move(file_path, quarantine_path)
+            logging.info(f"Malicious file quarantined: {file_path} -> {quarantine_path}")
         except Exception as e:
-            logging.error(f"Failed to remove {file_path}: {e}")
+            logging.error(f"Failed to quarantine {file_path}: {e}")
         return (True, "ExampleVirus")
     return (False, "")
 
@@ -235,7 +243,6 @@ class ScanWorker(QThread):
 
         for root, _, files in os.walk(self.folder_path):
             for file in files:
-                # Check for pause
                 self.mutex.lock()
                 while self._paused:
                     self.pause_condition.wait(self.mutex)
@@ -315,7 +322,7 @@ class ScanWorker(QThread):
 
     def stop(self):
         self._is_stopped = True
-        self.resume()  # In case it is paused
+        self.resume()
 
     def pause(self):
         self.mutex.lock()
@@ -333,7 +340,7 @@ class MonitorThread(QThread):
     """
     Monitors a directory for changes using Windows API.
     When a file is modified or created, it scans the file.
-    If malware is detected (and auto-removed), it emits a signal.
+    If malware is detected, it is auto-quarantined and a signal is emitted.
     """
     malware_detected = Signal(str, str)  # file_path, virus_name
 
@@ -376,7 +383,7 @@ class MonitorThread(QThread):
                     pathToScan = os.path.join(self.monitor_folder, file)
                     if os.path.exists(pathToScan):
                         logging.info(f"Real-time detected change: {pathToScan}")
-                        is_malware, virus_name = scan_and_remove_warn(pathToScan)
+                        is_malware, virus_name = scan_and_quarantine(pathToScan)
                         if is_malware:
                             self.malware_detected.emit(pathToScan, virus_name)
                     else:
@@ -394,6 +401,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Professional Antivirus Cloud Scanner")
+        # Set application icon.
+        self.setWindowIcon(QIcon("HydraDragonAV.ico"))
 
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
@@ -425,12 +434,13 @@ class MainWindow(QMainWindow):
         self.stop_scan_button.setEnabled(False)
         top_button_layout.addWidget(self.stop_scan_button)
         
-        self.remove_virus_button = QPushButton("Remove Viruses")
-        self.remove_virus_button.clicked.connect(self.remove_virus_files)
+        # Instead of asking to remove viruses, we now offer an "Open Quarantine" button.
+        self.remove_virus_button = QPushButton("Open Quarantine")
+        self.remove_virus_button.clicked.connect(self.open_quarantine_folder)
         self.remove_virus_button.setEnabled(False)
         top_button_layout.addWidget(self.remove_virus_button)
         
-        # New toggle button for real-time monitoring.
+        # Toggle button for real-time monitoring.
         self.monitor_button = QPushButton("Start Monitoring")
         self.monitor_button.setCheckable(True)
         self.monitor_button.clicked.connect(self.toggle_monitoring)
@@ -517,7 +527,7 @@ class MainWindow(QMainWindow):
         self.count_suspicious = 0
         self.total_scanned = 0
 
-        # List to store malicious file paths.
+        # List to store quarantined file paths.
         self.malicious_files = []
 
         self.scan_worker = None
@@ -683,6 +693,7 @@ class MainWindow(QMainWindow):
         self.animation_label.hide()
         if hasattr(self, "movie") and self.movie.isValid():
             self.movie.stop()
+        # Enable the "Open Quarantine" button if any files have been quarantined.
         if self.malicious_files:
             self.remove_virus_button.setEnabled(True)
         self.start_scan_button.setEnabled(True)
@@ -698,37 +709,14 @@ class MainWindow(QMainWindow):
         self.unknown_list.addItem("Scan complete!")
         self.log("Scan complete.")
 
-    def remove_virus_files(self):
-        if not self.malicious_files:
-            QMessageBox.information(self, "No Viruses Found", "No malicious files to remove.")
+    def open_quarantine_folder(self):
+        """Open the quarantine folder using the default file explorer."""
+        quarantine_folder = os.path.join(os.getcwd(), "quarantine")
+        if not os.path.exists(quarantine_folder):
+            QMessageBox.information(self, "Quarantine", "No quarantine folder exists.")
             return
-
-        reply = QMessageBox.question(
-            self,
-            "Confirm Removal",
-            f"Are you sure you want to permanently remove {len(self.malicious_files)} malicious file(s)?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        )
-        if reply == QMessageBox.Yes:
-            errors = []
-            for file_path in self.malicious_files:
-                try:
-                    if os.path.exists(file_path):
-                        os.remove(file_path)
-                    else:
-                        errors.append(f"File not found: {file_path}")
-                except Exception as e:
-                    errors.append(f"Error removing {file_path}: {e}")
-
-            if errors:
-                QMessageBox.warning(self, "Removal Errors", "\n".join(errors))
-            else:
-                QMessageBox.information(self, "Removal Successful", "All malicious files have been removed.")
-            self.malicious_list.addItem("Removal process complete.")
-            self.remove_virus_button.setEnabled(False)
-            self.malicious_files = []
-            self.log("Virus removal executed.")
+        QDesktopServices.openUrl(QUrl.fromLocalFile(quarantine_folder))
+        self.log("Opened quarantine folder.")
 
     def toggle_monitoring(self):
         if self.monitor_button.isChecked():
@@ -750,7 +738,7 @@ class MainWindow(QMainWindow):
             self.monitor_button.setText("Start Monitoring")
 
     def on_malware_detected(self, file_path, virus_name):
-        message = f"Malicious file auto-removed: {file_path}"
+        message = f"Malicious file auto-quarantined: {file_path}"
         if virus_name:
             message += f" (Virus: {virus_name})"
         self.malicious_list.addItem(message)
@@ -759,7 +747,7 @@ class MainWindow(QMainWindow):
         self.log("Real-time malware detection: " + message)
 
     def log(self, message):
-        # Helper function to log messages (could be extended to a dedicated log widget)
+        # Simple logging helper.
         print(message)
         logging.info(message)
 
