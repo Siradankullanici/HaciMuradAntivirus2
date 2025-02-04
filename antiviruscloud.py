@@ -114,13 +114,16 @@ def calculate_file_hash(file_path):
 
 def query_md5_online_sync(md5_hash):
     """
-    Queries an online database using the file's MD5 hash.
-    Risk Level (%)    Description
-        0             file is clean
-        10            file is clean (auto verdict)
-        70            malware suspicion
-        100           malware
-    Reference: https://api.nictasoft.com/api-file-20.php
+    Queries the online API and returns a tuple:
+        (risk_level, virus_name)
+    
+    The function inspects risk percentages:
+      - If the response indicates "[100% risk]", it returns ("Malware", virus_name)
+      - If the response indicates "[70% risk]", it returns ("Suspicious", virus_name)
+      - For safe statuses, it returns ("Benign", "") or ("Benign (auto verdict)", "")
+      - If the file is not yet rated or the result is unknown, returns ("Unknown", "")
+    
+    The virus_name is extracted from a "detected as" phrase if present.
     """
     try:
         md5_hash_upper = md5_hash.upper()
@@ -128,35 +131,41 @@ def query_md5_online_sync(md5_hash):
         response = requests.get(url)
 
         if response.status_code == 200:
-            result = response.text.strip().lower()
+            result = response.text.strip()
+            lower_result = result.lower()
 
-            # Malware Check (exact match)
-            if "[100% risk] malware" in result:
-                return "Malware"
-
-            # Safe Check (exact match)
-            if "[0% risk] safe" in result:
-                return "Benign"
-
-            # Safe Check (auto verdict)
-            if "[0% risk] safe" in result:
-                return "Benign (auto verdict)"
-
-            # Suspicious Check
-            if "[70% risk] safe" in result:
-                return "Suspicious"
-
-            # Unknown Check
-            if "this file is not yet rated" in result:
-                return "Unknown"
-
-            # Default Case
-            return "Unknown (Result)"
+            # Check for high-risk (malware) indication.
+            if "[100% risk]" in lower_result:
+                if "detected as" in lower_result:
+                    virus_name = result.split("detected as", 1)[1].strip().split()[0]
+                    return ("Malware", virus_name)
+                else:
+                    return ("Malware", "")
+            
+            # Check for 70% risk which we treat as suspicious.
+            if "[70% risk]" in lower_result:
+                if "detected as" in lower_result:
+                    virus_name = result.split("detected as", 1)[1].strip().split()[0]
+                    return ("Suspicious", virus_name)
+                else:
+                    return ("Suspicious", "")
+            
+            # Check safe statuses.
+            if "[0% risk]" in lower_result:
+                return ("Benign", "")
+            if "[10% risk]" in lower_result:
+                return ("Benign (auto verdict)", "")
+            
+            # Unknown status.
+            if "this file is not yet rated" in lower_result:
+                return ("Unknown", "")
+            
+            # Default case.
+            return ("Unknown (Result)", "")
         else:
-            return "Unknown (API error)"
-
+            return ("Unknown (API error)", "")
     except Exception as ex:
-        return f"Error: {ex}"
+        return (f"Error: {ex}", "")
 
 def local_analysis(file_path, file_data):
     """
@@ -185,23 +194,38 @@ def notify_user(file_path, virus_name=""):
 
 def scan_and_quarantine(file_path):
     """
-    Scans the file and, if malicious, auto-quarantines it.
-    A file is considered malicious in this demo if its name contains '.mal'.
-    It is moved to a quarantine folder in the current script directory.
-    Returns a tuple (is_malware, virus_name).
+    Scans the file by calculating its MD5 hash and querying the cloud.
+    If the risk level is Malware, the file is quarantined.
+    Returns a tuple: (is_malware, virus_or_risk)
+      - For Malware, virus_or_risk is the virus name (if available) or "Malware".
+      - For Suspicious files, returns (False, "Suspicious") (or with the virus name if provided).
+      - For other cases, returns (False, risk) where risk can be benign, unknown, etc.
     """
-    if ".mal" in file_path.lower():
-        quarantine_folder = os.path.join(os.getcwd(), "quarantine")
-        if not os.path.exists(quarantine_folder):
-            os.makedirs(quarantine_folder)
+    file_hash, file_data = calculate_file_hash(file_path)
+    if not file_hash:
+        return (False, "")
+    
+    risk, virus_name = query_md5_online_sync(file_hash)
+
+    # For safe or unknown statuses (including Suspicious), do not quarantine.
+    if risk in ["Benign", "Benign (auto verdict)", "Suspicious", "Unknown", "Unknown (Result)", "Unknown (API error)"] or risk.startswith("Error"):
+        return (False, virus_name if virus_name else risk)
+    
+    # If the risk is Malware, proceed with quarantine.
+    if risk == "Malware":
+        if not os.path.exists(QUARANTINE_FOLDER):
+            os.makedirs(QUARANTINE_FOLDER)
         base_name = os.path.basename(file_path)
-        quarantine_path = os.path.join(quarantine_folder, base_name)
+        quarantine_path = os.path.join(QUARANTINE_FOLDER, base_name)
         try:
             shutil.move(file_path, quarantine_path)
             logging.info(f"Malicious file quarantined: {file_path} -> {quarantine_path}")
+            update_quarantine_record(file_path, quarantine_path, virus_name if virus_name else "Malware")
         except Exception as e:
             logging.error(f"Failed to quarantine {file_path}: {e}")
-        return (True, "ExampleVirus")
+        return (True, virus_name if virus_name else "Malware")
+    
+    # Fallback.
     return (False, "")
 
 # ----------------- Worker Thread for Scanning -----------------
@@ -402,7 +426,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Professional Antivirus Cloud Scanner")
         # Set application icon.
-        self.setWindowIcon(QIcon("HydraDragonAV.ico"))
+        self.setWindowIcon(QIcon("assets\\HydraDragonAV.ico"))
 
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
