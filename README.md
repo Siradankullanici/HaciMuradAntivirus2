@@ -7,4 +7,4 @@ then do install python get-pip.py
 
 ### Notice
 - This fully cloud based antivirus based on NictaSoft. Old partner of Comodo.
-- This for ReactOS, I recommend you to use ClamAV with this tool for malware scan at ReactOS.
+- This demo of full antivirus product. If you using ReactOS I recommend you use this with ClamSentiel.
