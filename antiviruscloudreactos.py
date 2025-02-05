@@ -288,6 +288,7 @@ class MonitorThread(threading.Thread):
                     if os.path.exists(pathToScan):
                         is_malware, risk_result = scan_and_quarantine(pathToScan)
                         if is_malware:
+                            # Send monitor event and let the main window show a popup.
                             self.queue.put({'type': 'monitor_malware', 'data': (pathToScan, risk_result)})
                     else:
                         logging.warning("File not found: {}".format(pathToScan))
@@ -385,6 +386,15 @@ class MainApplication(tk.Tk):
         results_frame.grid_columnconfigure(2, weight=1)
         results_frame.grid_columnconfigure(3, weight=1)
 
+        # --- Manual Actions Frame ---
+        actions_frame = tk.Frame(self)
+        actions_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+        tk.Label(actions_frame, text="Manual Actions:").pack(side=tk.LEFT, padx=5)
+        self.delete_button = tk.Button(actions_frame, text="Delete Selected File", command=self.delete_selected)
+        self.delete_button.pack(side=tk.LEFT, padx=2)
+        self.quarantine_button = tk.Button(actions_frame, text="Quarantine Selected File", command=self.quarantine_selected)
+        self.quarantine_button.pack(side=tk.LEFT, padx=2)
+
         totals_frame = tk.Frame(self)
         totals_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
         self.total_scanned_label = tk.Label(totals_frame, text="Total Scanned: 0")
@@ -399,6 +409,63 @@ class MainApplication(tk.Tk):
         self.total_unknown_label.pack(side=tk.LEFT, padx=2)
 
         self.after(100, self.process_queue)
+
+    def extract_filepath(self, text):
+        """
+        Tries to extract a file path from a given text by looking for a line that starts with "Path: ".
+        Returns the file path if found, or None.
+        """
+        for line in text.splitlines():
+            if line.startswith("Path: "):
+                return line.replace("Path: ", "").strip()
+        # If not found, assume the entire text might be a path.
+        return text.strip()
+
+    def delete_selected(self):
+        """Deletes the file corresponding to the selected entry from any list."""
+        # Check each list for a selection.
+        for lst in [self.malicious_list, self.clean_list, self.suspicious_list, self.unknown_list]:
+            try:
+                index = lst.curselection()[0]
+                entry = lst.get(index)
+                file_path = self.extract_filepath(entry)
+                if file_path and os.path.exists(file_path):
+                    if messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete:\n{file_path}?"):
+                        try:
+                            os.remove(file_path)
+                            messagebox.showinfo("Delete", f"Deleted file:\n{file_path}")
+                            logging.info("Deleted file: " + file_path)
+                            lst.delete(index)
+                        except Exception as e:
+                            messagebox.showerror("Error", f"Failed to delete file:\n{file_path}\nError: {e}")
+                    return
+            except IndexError:
+                continue
+        messagebox.showwarning("No Selection", "Please select a file from one of the lists first.")
+
+    def quarantine_selected(self):
+        """Manually moves the selected file into the quarantine folder."""
+        for lst in [self.malicious_list, self.clean_list, self.suspicious_list, self.unknown_list]:
+            try:
+                index = lst.curselection()[0]
+                entry = lst.get(index)
+                file_path = self.extract_filepath(entry)
+                if file_path and os.path.exists(file_path):
+                    if not os.path.exists(QUARANTINE_FOLDER):
+                        os.makedirs(QUARANTINE_FOLDER)
+                    quarantine_path = os.path.join(QUARANTINE_FOLDER, os.path.basename(file_path))
+                    if messagebox.askyesno("Confirm Quarantine", f"Are you sure you want to quarantine:\n{file_path}?"):
+                        try:
+                            shutil.move(file_path, quarantine_path)
+                            messagebox.showinfo("Quarantine", f"File quarantined to:\n{quarantine_path}")
+                            logging.info("File quarantined: {} -> {}".format(file_path, quarantine_path))
+                            lst.delete(index)
+                        except Exception as e:
+                            messagebox.showerror("Error", f"Failed to quarantine file:\n{file_path}\nError: {e}")
+                    return
+            except IndexError:
+                continue
+        messagebox.showwarning("No Selection", "Please select a file from one of the lists first.")
 
     def select_folder(self):
         folder = filedialog.askdirectory(title="Select Folder to Scan")
@@ -546,7 +613,7 @@ class MainApplication(tk.Tk):
                     self.current_file_label.config(text="Current File: {}".format(data))
                 elif mtype == 'scan_complete':
                     unknown_count, malicious_count, clean_count, suspicious_count = data
-                    summary = ("Final Scan Summary: Malicious: {}, Clean: {}, Suspicious: {}, Unknown: {}"
+                    summary = ("Final Scan Summary:\nMalicious: {}, Clean: {}, Suspicious: {}, Unknown: {}"
                                .format(malicious_count, clean_count, suspicious_count, unknown_count))
                     self.current_file_label.config(text="Scan complete!")
                     self.malicious_list.insert(tk.END, "Scan complete!")
@@ -554,6 +621,7 @@ class MainApplication(tk.Tk):
                     self.suspicious_list.insert(tk.END, "Scan complete!")
                     self.unknown_list.insert(tk.END, "Scan complete!")
                     logging.info(summary)
+                    messagebox.showinfo("Scan Finished", summary)
                     self.start_scan_button.config(state=tk.NORMAL)
                     self.select_folder_button.config(state=tk.NORMAL)
                     self.stop_scan_button.config(state=tk.DISABLED)
@@ -571,10 +639,11 @@ class MainApplication(tk.Tk):
                     logging.info("Scan aborted.")
                 elif mtype == 'monitor_malware':
                     file_path, virus_info = data
-                    message = "Malicious file auto-quarantined: {} ({})".format(file_path, virus_info)
+                    message = "Malicious file auto-quarantined:\n{} ({})".format(file_path, virus_info)
                     self.malicious_list.insert(tk.END, message)
                     notify_user(file_path, virus_info)
                     logging.info("Real-time malware detection: " + message)
+                    messagebox.showinfo("Monitor Event", message)
                 self.queue.task_done()
         except queue.Empty:
             pass
