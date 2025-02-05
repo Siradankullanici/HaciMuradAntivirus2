@@ -12,6 +12,19 @@ os.environ["TK_LIBRARY"] = tk_dir
 # Use "Win32GUI" as the base for a Windows GUI application.
 base = "Win32GUI" if sys.platform == "win32" else None
 
+# Dynamically locate python35.dll (assumes it resides in sys.exec_prefix)
+python_dll = os.path.join(sys.exec_prefix, "python35.dll")
+include_files = [
+    (tcl_dir, "tcl"),
+    (tk_dir, "tk"),
+]
+
+# Add python35.dll if it exists.
+if os.path.exists(python_dll):
+    include_files.append(python_dll)
+else:
+    print("Warning: python35.dll not found at", python_dll)
+
 # Define build options.
 build_exe_options = {
     "packages": [
@@ -24,10 +37,7 @@ build_exe_options = {
         "re",
         "tkinter",
     ],
-    "include_files": [
-        (tcl_dir, "tcl"),
-        (tk_dir, "tk"),
-    ],
+    "include_files": include_files,
 }
 
 # Define the executable.

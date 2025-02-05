@@ -9,6 +9,7 @@ import requests
 import logging
 import threading
 import queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import win32file
 import win32con
@@ -32,7 +33,7 @@ application_log_file = os.path.join(log_directory, "antivirus.log")
 logging.basicConfig(
     filename=application_log_file,
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
 # Custom directory change flags
@@ -93,7 +94,7 @@ def local_analysis(file_path, file_data):
     try:
         file_name = os.path.basename(file_path)
         file_type, _ = mimetypes.guess_type(file_path)
-        return "Name: {} | Type: {}".format(file_name, file_type if file_type else 'Unknown')
+        return "Name: {} | Type: {}".format(file_name, file_type if file_type else "Unknown")
     except Exception as e:
         return "Local analysis error: {}".format(e)
 
@@ -105,10 +106,124 @@ def notify_user(file_path, virus_name=""):
         message = "Malicious file quarantined:\n{}\nVirus: {}".format(file_path, virus_name)
     else:
         message = "Malicious file quarantined:\n{}".format(file_path)
+    # Display notification (ensure your system supports Toast notifications)
     toaster.show_toast(title, message, duration=10)
 
-# Quarantine folder path.
+# Define the quarantine folder and JSON file to store quarantine records.
 QUARANTINE_FOLDER = os.path.join(os.getcwd(), "quarantine")
+QUARANTINE_DATA_FILE = os.path.join(QUARANTINE_FOLDER, "quarantine_data.json")
+
+def ensure_quarantine_folder():
+    if not os.path.exists(QUARANTINE_FOLDER):
+        os.makedirs(QUARANTINE_FOLDER)
+    # Ensure the JSON file exists.
+    if not os.path.exists(QUARANTINE_DATA_FILE):
+        with open(QUARANTINE_DATA_FILE, 'w') as f:
+            json.dump([], f)
+
+def add_quarantine_record(original_path, virus_name, quarantine_path):
+    """
+    Append a record to the quarantine JSON file.
+    Each record contains:
+      - original_path: the original file location
+      - quarantine_path: where the file is now located
+      - virus_name: the virus identifier (if any)
+      - date: timestamp of quarantine
+    """
+    ensure_quarantine_folder()
+    record = {
+        "original_path": original_path,
+        "quarantine_path": quarantine_path,
+        "virus_name": virus_name,
+        "date": datetime.datetime.now().isoformat()
+    }
+    try:
+        with open(QUARANTINE_DATA_FILE, 'r') as f:
+            data = json.load(f)
+    except Exception:
+        data = []
+    data.append(record)
+    with open(QUARANTINE_DATA_FILE, 'w') as f:
+        json.dump(data, f, indent=4)
+
+def open_quarantine_manager():
+    """
+    This function can be invoked by your quarantine manager GUI.
+    It reads the JSON file with quarantine records and returns the list.
+    """
+    ensure_quarantine_folder()
+    try:
+        with open(QUARANTINE_DATA_FILE, 'r') as f:
+            data = json.load(f)
+    except Exception as e:
+        logging.error("Failed to load quarantine data: {}".format(e))
+        data = []
+    return data
+
+def delete_all_quarantined_files():
+    """
+    Deletes all files recorded in the quarantine JSON and clears the JSON file.
+    Returns a list of any error messages encountered.
+    """
+    ensure_quarantine_folder()
+    try:
+        with open(QUARANTINE_DATA_FILE, 'r') as f:
+            records = json.load(f)
+    except Exception as e:
+        logging.error("Failed to load quarantine data: {}".format(e))
+        records = []
+    errors = []
+    for record in records:
+        quarantine_path = record.get("quarantine_path")
+        if quarantine_path and os.path.exists(quarantine_path):
+            try:
+                os.remove(quarantine_path)
+                logging.info("Deleted quarantined file: {}".format(quarantine_path))
+            except Exception as e:
+                errors.append("Failed to delete {}: {}".format(quarantine_path, e))
+    # Clear the quarantine JSON file
+    with open(QUARANTINE_DATA_FILE, 'w') as f:
+        json.dump([], f, indent=4)
+    return errors
+
+def restore_all_quarantined_files():
+    """
+    Restores all quarantined files to their original locations as recorded in the JSON file.
+    If a file already exists at the original location, that file is skipped.
+    Returns a list of any error messages encountered.
+    """
+    ensure_quarantine_folder()
+    try:
+        with open(QUARANTINE_DATA_FILE, 'r') as f:
+            records = json.load(f)
+    except Exception as e:
+        logging.error("Failed to load quarantine data: {}".format(e))
+        records = []
+    errors = []
+    restored_records = []
+    for record in records:
+        quarantine_path = record.get("quarantine_path")
+        original_path = record.get("original_path")
+        if quarantine_path and os.path.exists(quarantine_path):
+            # If a file already exists at the original location, skip restoration.
+            if os.path.exists(original_path):
+                errors.append("File already exists at original location: {}".format(original_path))
+                continue
+            try:
+                # Ensure the original directory exists
+                original_dir = os.path.dirname(original_path)
+                if not os.path.exists(original_dir):
+                    os.makedirs(original_dir)
+                shutil.move(quarantine_path, original_path)
+                logging.info("Restored file: {} -> {}".format(quarantine_path, original_path))
+                restored_records.append(record)
+            except Exception as e:
+                errors.append("Failed to restore {}: {}".format(quarantine_path, e))
+    # Remove restored records from the JSON file.
+    remaining_records = [rec for rec in records if rec not in restored_records]
+    with open(QUARANTINE_DATA_FILE, 'w') as f:
+        json.dump(remaining_records, f, indent=4)
+    return errors
 
 def scan_and_quarantine(file_path):
     """Scans the file, and if it is determined to be malware, moves it to the quarantine folder."""
@@ -135,85 +250,110 @@ def scan_and_quarantine(file_path):
     
     return (False, risk_result)
 
-# ----------------- Worker Thread for Scanning -----------------
+# ----------------- Multi-threaded Scan Worker -----------------
 class ScanWorker(threading.Thread):
     """
-    Worker thread to recursively scan a folder and its subfolders.
-    Uses os.walk to traverse directories.
+    Multi-threaded scan worker that uses a ThreadPoolExecutor to process files concurrently.
     """
-    def __init__(self, folder_path, queue):
+    def __init__(self, folder_path, queue, max_workers=200):
         threading.Thread.__init__(self)
         self.folder_path = folder_path
         self.queue = queue
         self.stop_event = threading.Event()
         self.pause_cond = threading.Condition()
         self.paused = False
+        self.max_workers = max_workers
 
     def run(self):
-        # Recursively traverse all subfolders
-        total_files = 0
+        # Gather all file paths from the folder (and subfolders)
+        file_paths = []
         for root, dirs, files in os.walk(self.folder_path):
-            total_files += len(files)
+            for file in files:
+                file_paths.append(os.path.join(root, file))
+        total_files = len(file_paths)
         if total_files == 0:
             self.queue.put({'type': 'scan_complete', 'data': (0, 0, 0, 0)})
             return
 
+        scanned_files = 0
+        # Counters for final summary
         clean_count = 0
         malicious_count = 0
-        unknown_count = 0
         suspicious_count = 0
-        scanned_files = 0
+        unknown_count = 0
 
-        for root, dirs, files in os.walk(self.folder_path):
-            for file in files:
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_path = {executor.submit(self.process_file, fp): fp for fp in file_paths}
+            for future in as_completed(future_to_path):
                 if self.stop_event.is_set():
                     self.queue.put({'type': 'scan_aborted'})
+                    executor.shutdown(wait=False)
                     return
 
-                with self.pause_cond:
-                    while self.paused:
-                        self.pause_cond.wait()
-                    if self.stop_event.is_set():
-                        self.queue.put({'type': 'scan_aborted'})
-                        return
+                result = future.result()  # result is a dict with keys: 'type' and 'data'
+                update_type = result.get("type")
+                data = result.get("data")
 
-                file_path = os.path.join(root, file)
-                file_hash, file_data = calculate_file_hash(file_path)
-                if file_hash is None:
+                if update_type == "update_clean":
                     clean_count += 1
-                    self.queue.put({'type': 'update_clean', 'data': "Clean File (Empty): {}".format(file_path)})
-                    scanned_files += 1
-                    self.queue.put({'type': 'update_progress', 'data': (scanned_files, total_files)})
-                    continue
-
-                risk_result = query_md5_online_sync(file_hash)
-                self.queue.put({'type': 'current_file', 'data': "{} -> {}".format(file_path, risk_result)})
-                local_info = local_analysis(file_path, file_data)
-
-                if risk_result.startswith("Benign"):
-                    clean_count += 1
-                    message = ("Clean File Detected:\nPath: {}\nMD5: {}\n{}\nStatus: {}\n{}"
-                               .format(file_path, file_hash, local_info, risk_result, "-" * 50))
-                    self.queue.put({'type': 'update_clean', 'data': message})
-                elif risk_result.startswith("Malware"):
+                elif update_type == "update_malicious":
                     malicious_count += 1
-                    message = ("Malicious File Detected:\nPath: {}\nMD5: {}\n{}\nStatus: {}\n{}"
-                               .format(file_path, file_hash, local_info, risk_result, "-" * 50))
-                    self.queue.put({'type': 'update_malicious', 'data': message})
-                elif risk_result.startswith("Suspicious"):
+                elif update_type == "update_suspicious":
                     suspicious_count += 1
-                    message = ("Suspicious File Detected:\nPath: {}\nMD5: {}\n{}\nStatus: {}\n{}"
-                               .format(file_path, file_hash, local_info, risk_result, "-" * 50))
-                    self.queue.put({'type': 'update_suspicious', 'data': message})
-                else:
+                elif update_type == "update_unknown":
                     unknown_count += 1
-                    message = ("Unknown File Detected:\nPath: {}\nMD5: {}\n{}\nStatus: {}\n{}"
-                               .format(file_path, file_hash, local_info, risk_result, "-" * 50))
-                    self.queue.put({'type': 'update_unknown', 'data': message})
 
+                self.queue.put(result)
                 scanned_files += 1
                 self.queue.put({'type': 'update_progress', 'data': (scanned_files, total_files)})
         self.queue.put({'type': 'scan_complete', 'data': (unknown_count, malicious_count, clean_count, suspicious_count)})
+
+    def process_file(self, file_path):
+        # Pause support
+        with self.pause_cond:
+            while self.paused:
+                self.pause_cond.wait()
+            if self.stop_event.is_set():
+                return {'type': 'skipped', 'data': "Scan aborted: {}".format(file_path)}
+
+        file_hash, file_data = calculate_file_hash(file_path)
+        if not file_hash:
+            msg = "Clean File (Empty): {}".format(file_path)
+            return {'type': 'update_clean', 'data': msg}
+
+        risk_result = query_md5_online_sync(file_hash)
+        local_info = local_analysis(file_path, file_data)
+        self.queue.put({'type': 'current_file', 'data': "{} -> {}".format(file_path, risk_result)})
+
+        if risk_result.startswith("Benign"):
+            msg = ("Clean File Detected:\nPath: {}\nMD5: {}\n{}\nStatus: {}\n{}"
+                   .format(file_path, file_hash, local_info, risk_result, "-" * 50))
+            return {'type': 'update_clean', 'data': msg}
+
+        elif risk_result.startswith("Malware"):
+            ensure_quarantine_folder()
+            quarantine_path = os.path.join(QUARANTINE_FOLDER, os.path.basename(file_path))
+            try:
+                shutil.move(file_path, quarantine_path)
+                logging.info("Malicious file quarantined: {} -> {}".format(file_path, quarantine_path))
+                add_quarantine_record(file_path, risk_result, quarantine_path)
+                # Notify the user after successful quarantine
+                notify_user(file_path, risk_result)
+            except Exception as e:
+                logging.error("Failed to quarantine {}: {}".format(file_path, e))
+            msg = ("Malicious File Detected:\nPath: {}\nMD5: {}\n{}\nStatus: {}\n{}"
+                   .format(file_path, file_hash, local_info, risk_result, "-" * 50))
+            return {'type': 'update_malicious', 'data': msg}
+
+        elif risk_result.startswith("Suspicious"):
+            msg = ("Suspicious File Detected:\nPath: {}\nMD5: {}\n{}\nStatus: {}\n{}"
+                   .format(file_path, file_hash, local_info, risk_result, "-" * 50))
+            return {'type': 'update_suspicious', 'data': msg}
+
+        else:
+            msg = ("Unknown File Detected:\nPath: {}\nMD5: {}\n{}\nStatus: {}\n{}"
+                   .format(file_path, file_hash, local_info, risk_result, "-" * 50))
+            return {'type': 'update_unknown', 'data': msg}
 
     def pause(self):
         with self.pause_cond:
@@ -229,16 +369,26 @@ class ScanWorker(threading.Thread):
         self.resume()
 
 # ----------------- Real-Time Monitoring Thread -----------------
+import win32file
+import win32con
+# Some file change constants might be imported or defined elsewhere:
+FILE_NOTIFY_CHANGE_LAST_ACCESS = 0x00000020
+FILE_NOTIFY_CHANGE_CREATION = 0x00000040
+FILE_NOTIFY_CHANGE_EA = 0x00000080
+FILE_NOTIFY_CHANGE_STREAM_NAME = 0x00000800
+FILE_NOTIFY_CHANGE_STREAM_SIZE = 0x00001000
+FILE_NOTIFY_CHANGE_STREAM_WRITE = 0x00002000
+
 class MonitorThread(threading.Thread):
     """
-    Monitors a directory and its subdirectories for changes using the Windows API.
-    Uses an extended set of flags to capture various file change events.
+    Monitors a directory for changes and processes changed files concurrently.
     """
-    def __init__(self, monitor_folder, queue):
+    def __init__(self, monitor_folder, queue, max_workers=200):
         threading.Thread.__init__(self)
         self.monitor_folder = monitor_folder
         self.queue = queue
         self.stop_event = threading.Event()
+        self.max_workers = max_workers
 
     def run(self):
         if not os.path.exists(self.monitor_folder):
@@ -255,7 +405,6 @@ class MonitorThread(threading.Thread):
             None
         )
 
-        # Combine standard flags with custom flags
         change_flags = (
             win32con.FILE_NOTIFY_CHANGE_FILE_NAME |
             win32con.FILE_NOTIFY_CHANGE_DIR_NAME |
@@ -271,41 +420,74 @@ class MonitorThread(threading.Thread):
             FILE_NOTIFY_CHANGE_STREAM_WRITE
         )
 
-        try:
-            # The 'True' parameter ensures subdirectories are watched.
-            while not self.stop_event.is_set():
-                results = win32file.ReadDirectoryChangesW(
-                    hDir,
-                    1024,
-                    True,      # Watch subfolders
-                    change_flags,
-                    None,
-                    None
-                )
-                for action, file in results:
-                    # The returned 'file' is relative to the monitored folder.
-                    pathToScan = os.path.join(self.monitor_folder, file)
-                    if os.path.exists(pathToScan):
-                        is_malware, risk_result = scan_and_quarantine(pathToScan)
-                        if is_malware:
-                            # Send monitor event and let the main window show a popup.
-                            self.queue.put({'type': 'monitor_malware', 'data': (pathToScan, risk_result)})
-                    else:
-                        logging.warning("File not found: {}".format(pathToScan))
-        except Exception as ex:
-            logging.error("Error in MonitorThread: {}".format(ex))
-        finally:
-            win32file.CloseHandle(hDir)
+        # Create a ThreadPoolExecutor for processing file changes
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            try:
+                while not self.stop_event.is_set():
+                    results = win32file.ReadDirectoryChangesW(
+                        hDir,
+                        1024,
+                        True,
+                        change_flags,
+                        None,
+                        None
+                    )
+                    for action, file in results:
+                        pathToScan = os.path.join(self.monitor_folder, file)
+                        if os.path.exists(pathToScan):
+                            # Submit the scanning of this file in a separate thread.
+                            executor.submit(self.process_changed_file, pathToScan)
+                        else:
+                            logging.warning("File not found: {}".format(pathToScan))
+            except Exception as ex:
+                logging.error("Error in MonitorThread: {}".format(ex))
+            finally:
+                win32file.CloseHandle(hDir)
+
+    def process_changed_file(self, file_path):
+        # Use the same scanning logic as in ScanWorker's process_file
+        file_hash, file_data = calculate_file_hash(file_path)
+        if not file_hash:
+            return
+        risk_result = query_md5_online_sync(file_hash)
+        # Update the UI about the current file (if needed)
+        self.queue.put({'type': 'current_file', 'data': "{} -> {}".format(file_path, risk_result)})
+        if risk_result.startswith("Malware"):
+            ensure_quarantine_folder()
+            quarantine_path = os.path.join(QUARANTINE_FOLDER, os.path.basename(file_path))
+            try:
+                shutil.move(file_path, quarantine_path)
+                logging.info("Real-time: Malicious file quarantined: {} -> {}".format(file_path, quarantine_path))
+                add_quarantine_record(file_path, risk_result, quarantine_path)
+                notify_user(file_path, risk_result)
+            except Exception as e:
+                logging.error("Real-time: Failed to quarantine {}: {}".format(file_path, e))
+            self.queue.put({'type': 'monitor_malware', 'data': (file_path, risk_result)})
 
     def stop(self):
         self.stop_event.set()
+
+# ----------------- Quarantine Manager Function -----------------
+def open_quarantine_manager():
+    """
+    This function can be invoked by your quarantine manager GUI.
+    It reads the JSON file with quarantine records and returns the list.
+    """
+    ensure_quarantine_folder()
+    try:
+        with open(QUARANTINE_DATA_FILE, 'r') as f:
+            data = json.load(f)
+    except Exception as e:
+        logging.error("Failed to load quarantine data: {}".format(e))
+        data = []
+    return data
 
 # ----------------- Main Application Window -----------------
 class MainApplication(tk.Tk):
     def __init__(self):
         tk.Tk.__init__(self)
         self.title("Haci Murad Antivirus Cloud Scanner")
-        self.geometry("1200x750")
+        self.geometry("700x370")
 
         self.queue = queue.Queue()
         self.scan_thread = None
@@ -386,6 +568,12 @@ class MainApplication(tk.Tk):
         results_frame.grid_columnconfigure(2, weight=1)
         results_frame.grid_columnconfigure(3, weight=1)
 
+        # Bind right-click on each list to show a context menu.
+        self.malicious_list.bind("<Button-3>", self.on_list_right_click)
+        self.clean_list.bind("<Button-3>", self.on_list_right_click)
+        self.suspicious_list.bind("<Button-3>", self.on_list_right_click)
+        self.unknown_list.bind("<Button-3>", self.on_list_right_click)
+
         # --- Manual Actions Frame ---
         actions_frame = tk.Frame(self)
         actions_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
@@ -394,6 +582,10 @@ class MainApplication(tk.Tk):
         self.delete_button.pack(side=tk.LEFT, padx=2)
         self.quarantine_button = tk.Button(actions_frame, text="Quarantine Selected File", command=self.quarantine_selected)
         self.quarantine_button.pack(side=tk.LEFT, padx=2)
+        self.delete_all_button = tk.Button(actions_frame, text="Delete All", command=self.delete_all)
+        self.delete_all_button.pack(side=tk.LEFT, padx=2)
+        self.quarantine_all_button = tk.Button(actions_frame, text="Quarantine All", command=self.quarantine_all)
+        self.quarantine_all_button.pack(side=tk.LEFT, padx=2)
 
         totals_frame = tk.Frame(self)
         totals_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
@@ -413,32 +605,79 @@ class MainApplication(tk.Tk):
     def extract_filepath(self, text):
         """
         Tries to extract a file path from a given text by looking for a line that starts with "Path: ".
-        Returns the file path if found, or None.
+        Returns the file path if found, or the text stripped.
         """
         for line in text.splitlines():
             if line.startswith("Path: "):
                 return line.replace("Path: ", "").strip()
-        # If not found, assume the entire text might be a path.
         return text.strip()
+
+    def on_list_right_click(self, event):
+        """Show a context menu with actions for the selected list item."""
+        widget = event.widget
+        try:
+            index = widget.nearest(event.y)
+            widget.selection_clear(0, tk.END)
+            widget.selection_set(index)
+            entry = widget.get(index)
+        except Exception:
+            return
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Delete", command=lambda: self.delete_selected_item(widget, index))
+        menu.add_command(label="Quarantine", command=lambda: self.quarantine_selected_item(widget, index))
+        menu.add_command(label="Skip", command=lambda: self.skip_selected_item(widget, index))
+        menu.tk_popup(event.x_root, event.y_root)
+        menu.grab_release()
+
+    def delete_selected_item(self, lst, index):
+        """Deletes the file corresponding to the selected item in the given list."""
+        entry = lst.get(index)
+        file_path = self.extract_filepath(entry)
+        if file_path and os.path.exists(file_path):
+            if messagebox.askyesno("Confirm Delete", "Are you sure you want to delete:\n{}".format(file_path)):
+                try:
+                    os.remove(file_path)
+                    messagebox.showinfo("Delete", "Deleted file:\n{}".format(file_path))
+                    logging.info("Deleted file: " + file_path)
+                    lst.delete(index)
+                except Exception as e:
+                    messagebox.showerror("Error", "Failed to delete file:\n{}\nError: {}".format(file_path, e))
+        else:
+            messagebox.showwarning("Not Found", "File does not exist:\n{}".format(file_path))
+
+    def quarantine_selected_item(self, lst, index):
+        """Moves the selected file into the quarantine folder."""
+        entry = lst.get(index)
+        file_path = self.extract_filepath(entry)
+        if file_path and os.path.exists(file_path):
+            if not os.path.exists(QUARANTINE_FOLDER):
+                os.makedirs(QUARANTINE_FOLDER)
+            quarantine_path = os.path.join(QUARANTINE_FOLDER, os.path.basename(file_path))
+            if messagebox.askyesno("Confirm Quarantine", "Are you sure you want to quarantine:\n{}".format(file_path)):
+                try:
+                    shutil.move(file_path, quarantine_path)
+                    messagebox.showinfo("Quarantine", "File quarantined to:\n{}".format(quarantine_path))
+                    logging.info("File quarantined: {} -> {}".format(file_path, quarantine_path))
+                    lst.delete(index)
+                except Exception as e:
+                    messagebox.showerror("Error", "Failed to quarantine file:\n{}\nError: {}".format(file_path, e))
+        else:
+            messagebox.showwarning("Not Found", "File does not exist:\n{}".format(file_path))
+
+    def skip_selected_item(self, lst, index):
+        """Simply notifies the user that the file was skipped."""
+        entry = lst.get(index)
+        file_path = self.extract_filepath(entry)
+        messagebox.showinfo("Skip", "File skipped:\n{}".format(file_path))
+        logging.info("File skipped: " + file_path)
 
     def delete_selected(self):
         """Deletes the file corresponding to the selected entry from any list."""
-        # Check each list for a selection.
         for lst in [self.malicious_list, self.clean_list, self.suspicious_list, self.unknown_list]:
             try:
                 index = lst.curselection()[0]
-                entry = lst.get(index)
-                file_path = self.extract_filepath(entry)
-                if file_path and os.path.exists(file_path):
-                    if messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete:\n{file_path}?"):
-                        try:
-                            os.remove(file_path)
-                            messagebox.showinfo("Delete", f"Deleted file:\n{file_path}")
-                            logging.info("Deleted file: " + file_path)
-                            lst.delete(index)
-                        except Exception as e:
-                            messagebox.showerror("Error", f"Failed to delete file:\n{file_path}\nError: {e}")
-                    return
+                self.delete_selected_item(lst, index)
+                return
             except IndexError:
                 continue
         messagebox.showwarning("No Selection", "Please select a file from one of the lists first.")
@@ -448,24 +687,74 @@ class MainApplication(tk.Tk):
         for lst in [self.malicious_list, self.clean_list, self.suspicious_list, self.unknown_list]:
             try:
                 index = lst.curselection()[0]
-                entry = lst.get(index)
-                file_path = self.extract_filepath(entry)
-                if file_path and os.path.exists(file_path):
-                    if not os.path.exists(QUARANTINE_FOLDER):
-                        os.makedirs(QUARANTINE_FOLDER)
-                    quarantine_path = os.path.join(QUARANTINE_FOLDER, os.path.basename(file_path))
-                    if messagebox.askyesno("Confirm Quarantine", f"Are you sure you want to quarantine:\n{file_path}?"):
-                        try:
-                            shutil.move(file_path, quarantine_path)
-                            messagebox.showinfo("Quarantine", f"File quarantined to:\n{quarantine_path}")
-                            logging.info("File quarantined: {} -> {}".format(file_path, quarantine_path))
-                            lst.delete(index)
-                        except Exception as e:
-                            messagebox.showerror("Error", f"Failed to quarantine file:\n{file_path}\nError: {e}")
-                    return
+                self.quarantine_selected_item(lst, index)
+                return
             except IndexError:
                 continue
         messagebox.showwarning("No Selection", "Please select a file from one of the lists first.")
+
+    def delete_all(self):
+        """Deletes all files listed in all lists after confirmation."""
+        all_files = []
+        for lst in [self.malicious_list, self.clean_list, self.suspicious_list, self.unknown_list]:
+            for i in range(lst.size()):
+                entry = lst.get(i)
+                file_path = self.extract_filepath(entry)
+                if file_path and file_path not in all_files:
+                    all_files.append(file_path)
+        if not all_files:
+            messagebox.showwarning("No Files", "No files to delete.")
+            return
+        if messagebox.askyesno("Confirm Delete All", "Are you sure you want to delete all files listed?"):
+            errors = []
+            for file_path in all_files:
+                if os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                        logging.info("Deleted file: " + file_path)
+                    except Exception as e:
+                        errors.append("Failed to delete {}: {}".format(file_path, e))
+            if errors:
+                messagebox.showerror("Delete All Errors", "\n".join(errors))
+            else:
+                messagebox.showinfo("Delete All", "All files deleted.")
+            self.malicious_list.delete(0, tk.END)
+            self.clean_list.delete(0, tk.END)
+            self.suspicious_list.delete(0, tk.END)
+            self.unknown_list.delete(0, tk.END)
+
+    def quarantine_all(self):
+        """Moves all files listed in all lists to the quarantine folder after confirmation."""
+        all_files = []
+        for lst in [self.malicious_list, self.clean_list, self.suspicious_list, self.unknown_list]:
+            for i in range(lst.size()):
+                entry = lst.get(i)
+                file_path = self.extract_filepath(entry)
+                if file_path and file_path not in all_files:
+                    all_files.append(file_path)
+        if not all_files:
+            messagebox.showwarning("No Files", "No files to quarantine.")
+            return
+        if messagebox.askyesno("Confirm Quarantine All", "Are you sure you want to quarantine all files listed?"):
+            if not os.path.exists(QUARANTINE_FOLDER):
+                os.makedirs(QUARANTINE_FOLDER)
+            errors = []
+            for file_path in all_files:
+                if os.path.exists(file_path):
+                    quarantine_path = os.path.join(QUARANTINE_FOLDER, os.path.basename(file_path))
+                    try:
+                        shutil.move(file_path, quarantine_path)
+                        logging.info("File quarantined: {} -> {}".format(file_path, quarantine_path))
+                    except Exception as e:
+                        errors.append("Failed to quarantine {}: {}".format(file_path, e))
+            if errors:
+                messagebox.showerror("Quarantine All Errors", "\n".join(errors))
+            else:
+                messagebox.showinfo("Quarantine All", "All files quarantined.")
+            self.malicious_list.delete(0, tk.END)
+            self.clean_list.delete(0, tk.END)
+            self.suspicious_list.delete(0, tk.END)
+            self.unknown_list.delete(0, tk.END)
 
     def select_folder(self):
         folder = filedialog.askdirectory(title="Select Folder to Scan")
@@ -583,35 +872,36 @@ class MainApplication(tk.Tk):
         try:
             while True:
                 msg = self.queue.get_nowait()
-                mtype = msg.get('type')
-                data = msg.get('data')
-                if mtype == 'update_malicious':
+                mtype = msg.get("type")
+                data = msg.get("data")
+                if mtype == "update_malicious":
                     self.count_malicious += 1
                     self.malicious_list.insert(tk.END, data)
                     for line in data.splitlines():
                         if line.startswith("Path: "):
                             file_path = line.replace("Path: ", "").strip()
-                            self.malicious_files.append(file_path)
+                            if file_path not in self.malicious_files:
+                                self.malicious_files.append(file_path)
                             break
-                elif mtype == 'update_clean':
+                elif mtype == "update_clean":
                     self.count_clean += 1
                     self.clean_list.insert(tk.END, data)
-                elif mtype == 'update_suspicious':
+                elif mtype == "update_suspicious":
                     self.count_suspicious += 1
                     self.suspicious_list.insert(tk.END, data)
-                elif mtype == 'update_unknown':
+                elif mtype == "update_unknown":
                     self.count_unknown += 1
                     self.unknown_list.insert(tk.END, data)
-                elif mtype == 'update_progress':
+                elif mtype == "update_progress":
                     scanned, total = data
                     self.total_scanned = scanned
                     self.scanned_count_label.config(text="Scanned: {} / {}".format(scanned, total))
                     percent = int((scanned / float(total)) * 100)
                     self.progress_var.set(percent)
                     self.update_totals()
-                elif mtype == 'current_file':
+                elif mtype == "current_file":
                     self.current_file_label.config(text="Current File: {}".format(data))
-                elif mtype == 'scan_complete':
+                elif mtype == "scan_complete":
                     unknown_count, malicious_count, clean_count, suspicious_count = data
                     summary = ("Final Scan Summary:\nMalicious: {}, Clean: {}, Suspicious: {}, Unknown: {}"
                                .format(malicious_count, clean_count, suspicious_count, unknown_count))
@@ -629,7 +919,7 @@ class MainApplication(tk.Tk):
                     self.resume_scan_button.config(state=tk.DISABLED)
                     if self.malicious_files:
                         self.open_quarantine_button.config(state=tk.NORMAL)
-                elif mtype == 'scan_aborted':
+                elif mtype == "scan_aborted":
                     self.current_file_label.config(text="Scan Aborted")
                     self.start_scan_button.config(state=tk.NORMAL)
                     self.select_folder_button.config(state=tk.NORMAL)
@@ -637,7 +927,7 @@ class MainApplication(tk.Tk):
                     self.pause_scan_button.config(state=tk.DISABLED)
                     self.resume_scan_button.config(state=tk.DISABLED)
                     logging.info("Scan aborted.")
-                elif mtype == 'monitor_malware':
+                elif mtype == "monitor_malware":
                     file_path, virus_info = data
                     message = "Malicious file auto-quarantined:\n{} ({})".format(file_path, virus_info)
                     self.malicious_list.insert(tk.END, message)
