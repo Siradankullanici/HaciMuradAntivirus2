@@ -31,16 +31,21 @@ if not os.path.exists(log_directory):
 application_log_file = os.path.join(log_directory, "antivirus.log")
 logging.basicConfig(
     filename=application_log_file,
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
 )
 
+# Custom directory change flags
+FILE_NOTIFY_CHANGE_LAST_ACCESS    = 0x00000020
+FILE_NOTIFY_CHANGE_CREATION       = 0x00000040
+FILE_NOTIFY_CHANGE_EA             = 0x00000080
+FILE_NOTIFY_CHANGE_STREAM_NAME    = 0x00000200
+FILE_NOTIFY_CHANGE_STREAM_SIZE    = 0x00000400
+FILE_NOTIFY_CHANGE_STREAM_WRITE   = 0x00000800
+
 # ----------------- Helper Functions -----------------
 def calculate_file_hash(file_path):
-    """
-    Returns the MD5 hash (as a hex string) and the file content.
-    If the file is empty, returns None for the hash.
-    """
+    """Returns the MD5 hash (as a hex string) and file content. If the file is empty, returns None for the hash."""
     try:
         with open(file_path, "rb") as file:
             file_data = file.read()
@@ -51,9 +56,7 @@ def calculate_file_hash(file_path):
         return None, None
 
 def query_md5_online_sync(md5_hash):
-    """
-    Queries the online API and returns a risk string.
-    """
+    """Queries the online API and returns a risk string."""
     try:
         md5_hash_upper = md5_hash.upper()
         url = "https://www.nictasoft.com/ace/md5/{}".format(md5_hash_upper)
@@ -86,10 +89,7 @@ def query_md5_online_sync(md5_hash):
         return "Error: {}".format(ex)
 
 def local_analysis(file_path, file_data):
-    """
-    Performs a local analysis of the file.
-    Returns a string with the file name and type.
-    """
+    """Performs a local analysis of the file. Returns a string with the file name and type."""
     try:
         file_name = os.path.basename(file_path)
         file_type, _ = mimetypes.guess_type(file_path)
@@ -98,9 +98,7 @@ def local_analysis(file_path, file_data):
         return "Local analysis error: {}".format(e)
 
 def notify_user(file_path, virus_name=""):
-    """
-    Sends a desktop notification for a malware detection using win10toast.
-    """
+    """Sends a desktop notification for a malware detection using win10toast."""
     toaster = ToastNotifier()
     title = "Malware Alert"
     if virus_name:
@@ -113,17 +111,14 @@ def notify_user(file_path, virus_name=""):
 QUARANTINE_FOLDER = os.path.join(os.getcwd(), "quarantine")
 
 def scan_and_quarantine(file_path):
-    """
-    Scans the file by calculating its MD5 hash and querying the cloud.
-    If the risk level is Malware, the file is quarantined.
-    Returns a tuple: (is_malware, status)
-    """
+    """Scans the file, and if it is determined to be malware, moves it to the quarantine folder."""
     file_hash, file_data = calculate_file_hash(file_path)
     if not file_hash:
         return (False, "Clean (Empty file)")
     
     risk_result = query_md5_online_sync(file_hash)
-    if risk_result.startswith("Benign") or risk_result.startswith("Suspicious") or risk_result.startswith("Unknown") or risk_result.startswith("Error"):
+    if risk_result.startswith("Benign") or risk_result.startswith("Suspicious") or \
+       risk_result.startswith("Unknown") or risk_result.startswith("Error"):
         return (False, risk_result)
     
     if "Malware" in risk_result:
@@ -143,8 +138,8 @@ def scan_and_quarantine(file_path):
 # ----------------- Worker Thread for Scanning -----------------
 class ScanWorker(threading.Thread):
     """
-    Worker thread to scan a folder.
-    Uses a condition variable for pause/resume and blocking I/O for speed.
+    Worker thread to recursively scan a folder and its subfolders.
+    Uses os.walk to traverse directories.
     """
     def __init__(self, folder_path, queue):
         threading.Thread.__init__(self)
@@ -155,7 +150,10 @@ class ScanWorker(threading.Thread):
         self.paused = False
 
     def run(self):
-        total_files = sum(len(files) for _, _, files in os.walk(self.folder_path))
+        # Recursively traverse all subfolders
+        total_files = 0
+        for root, dirs, files in os.walk(self.folder_path):
+            total_files += len(files)
         if total_files == 0:
             self.queue.put({'type': 'scan_complete', 'data': (0, 0, 0, 0)})
             return
@@ -166,7 +164,7 @@ class ScanWorker(threading.Thread):
         suspicious_count = 0
         scanned_files = 0
 
-        for root, _, files in os.walk(self.folder_path):
+        for root, dirs, files in os.walk(self.folder_path):
             for file in files:
                 if self.stop_event.is_set():
                     self.queue.put({'type': 'scan_aborted'})
@@ -233,8 +231,8 @@ class ScanWorker(threading.Thread):
 # ----------------- Real-Time Monitoring Thread -----------------
 class MonitorThread(threading.Thread):
     """
-    Monitors a directory for changes using the Windows API.
-    The ReadDirectoryChangesW call blocks until there is a file change.
+    Monitors a directory and its subdirectories for changes using the Windows API.
+    Uses an extended set of flags to capture various file change events.
     """
     def __init__(self, monitor_folder, queue):
         threading.Thread.__init__(self)
@@ -257,25 +255,37 @@ class MonitorThread(threading.Thread):
             None
         )
 
+        # Combine standard flags with custom flags
+        change_flags = (
+            win32con.FILE_NOTIFY_CHANGE_FILE_NAME |
+            win32con.FILE_NOTIFY_CHANGE_DIR_NAME |
+            win32con.FILE_NOTIFY_CHANGE_ATTRIBUTES |
+            win32con.FILE_NOTIFY_CHANGE_SIZE |
+            win32con.FILE_NOTIFY_CHANGE_LAST_WRITE |
+            win32con.FILE_NOTIFY_CHANGE_SECURITY |
+            FILE_NOTIFY_CHANGE_LAST_ACCESS |
+            FILE_NOTIFY_CHANGE_CREATION |
+            FILE_NOTIFY_CHANGE_EA |
+            FILE_NOTIFY_CHANGE_STREAM_NAME |
+            FILE_NOTIFY_CHANGE_STREAM_SIZE |
+            FILE_NOTIFY_CHANGE_STREAM_WRITE
+        )
+
         try:
+            # The 'True' parameter ensures subdirectories are watched.
             while not self.stop_event.is_set():
                 results = win32file.ReadDirectoryChangesW(
                     hDir,
                     1024,
-                    True,
-                    win32con.FILE_NOTIFY_CHANGE_FILE_NAME |
-                    win32con.FILE_NOTIFY_CHANGE_DIR_NAME |
-                    win32con.FILE_NOTIFY_CHANGE_ATTRIBUTES |
-                    win32con.FILE_NOTIFY_CHANGE_SIZE |
-                    win32con.FILE_NOTIFY_CHANGE_LAST_WRITE |
-                    win32con.FILE_NOTIFY_CHANGE_SECURITY,
+                    True,      # Watch subfolders
+                    change_flags,
                     None,
                     None
                 )
                 for action, file in results:
+                    # The returned 'file' is relative to the monitored folder.
                     pathToScan = os.path.join(self.monitor_folder, file)
                     if os.path.exists(pathToScan):
-                        logging.info("Real-time change detected: {}".format(pathToScan))
                         is_malware, risk_result = scan_and_quarantine(pathToScan)
                         if is_malware:
                             self.queue.put({'type': 'monitor_malware', 'data': (pathToScan, risk_result)})
