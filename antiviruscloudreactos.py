@@ -1,3 +1,6 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
 import os
 import sys
 import shutil
@@ -7,95 +10,18 @@ import requests
 import time
 import re
 import logging
+import threading
+import queue
 
-# Windows API for directory monitoring.
 import win32file
 import win32con
 
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QPushButton, QFileDialog,
-    QListWidget, QLabel, QMessageBox, QHBoxLayout, QProgressBar, QGroupBox, QGridLayout
-)
-from PyQt5.QtCore import QThread, Signal, Qt, QMutex, QWaitCondition, QUrl
-from PyQt5.QtGui import QMovie, QIcon
-from PyQt5.QtGui import QDesktopServices
+# Use win10toast for notifications (compatible with Python 3.5)
+from win10toast import ToastNotifier
 
-# For desktop notifications.
-from notifypy import Notify
-
-# ----------------- Antivirus Style Sheet -----------------
-antivirus_style = """
-QWidget {
-    background-color: #2b2b2b;
-    color: #e0e0e0;
-    font-family: Arial, sans-serif;
-    font-size: 14px;
-}
-
-QPushButton {
-    background: qradialgradient(cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5,
-                                stop:0.2 #007bff, stop:0.8 #0056b3);
-    color: white;
-    border: 2px solid #007bff;
-    padding: 4px 10px;
-    border-radius: 8px;
-    min-width: 70px;
-    font-weight: bold;
-    text-align: center;
-    qproperty-iconSize: 16px;
-}
-
-QPushButton:hover {
-    background: qradialgradient(cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5,
-                                stop:0.2 #0056b3, stop:0.8 #004380);
-    border-color: #0056b3;
-}
-
-QPushButton:pressed {
-    background: qradialgradient(cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5,
-                                stop:0.2 #004380, stop:0.8 #003d75);
-    border-color: #004380;
-}
-
-QLabel {
-    color: #e0e0e0;
-}
-
-QFileDialog {
-    background-color: #2b2b2b;
-    color: #e0e0e0;
-}
-
-QListWidget {
-    background-color: #3c3c3c;
-    color: #e0e0e0;
-    border: 1px solid #5a5a5a;
-}
-
-QListWidget::item {
-    padding: 4px;
-}
-
-QListWidget::item:selected {
-    background-color: #007bff;
-    color: white;
-}
-
-QProgressBar {
-    background-color: #3c3c3c;
-    border: 1px solid #5a5a5a;
-    text-align: center;
-}
-
-QDialog {
-    background-color: #2b2b2b;
-    color: #e0e0e0;
-}
-
-QDialogButtonBox {
-    background-color: #2b2b2b;
-}
-"""
+# Tkinter imports for Python 3
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
 
 # ----------------- Helper Functions -----------------
 def calculate_file_hash(file_path):
@@ -114,16 +40,8 @@ def calculate_file_hash(file_path):
 
 def query_md5_online_sync(md5_hash):
     """
-    Queries the online API and returns a tuple:
-        (risk_level, virus_name)
-    
-    The function inspects risk percentages:
-      - If the response indicates "[100% risk]", it returns ("Malware", virus_name)
-      - If the response indicates "[70% risk]", it returns ("Suspicious", virus_name)
-      - For safe statuses, it returns ("Benign", "") or ("Benign (auto verdict)", "")
-      - If the file is not yet rated or the result is unknown, returns ("Unknown", "")
-    
-    The virus_name is extracted from a "detected as" phrase if present.
+    Queries the online API and returns a risk string.
+    The returned risk string is based on the online results.
     """
     try:
         md5_hash_upper = md5_hash.upper()
@@ -138,34 +56,34 @@ def query_md5_online_sync(md5_hash):
             if "[100% risk]" in lower_result:
                 if "detected as" in lower_result:
                     virus_name = result.split("detected as", 1)[1].strip().split()[0]
-                    return ("Malware", virus_name)
+                    return "Malware ({})".format(virus_name)
                 else:
-                    return ("Malware", "")
+                    return "Malware"
             
             # Check for 70% risk which we treat as suspicious.
             if "[70% risk]" in lower_result:
                 if "detected as" in lower_result:
                     virus_name = result.split("detected as", 1)[1].strip().split()[0]
-                    return ("Suspicious", virus_name)
+                    return "Suspicious ({})".format(virus_name)
                 else:
-                    return ("Suspicious", "")
+                    return "Suspicious"
             
             # Check safe statuses.
             if "[0% risk]" in lower_result:
-                return ("Benign", "")
+                return "Benign"
             if "[10% risk]" in lower_result:
-                return ("Benign (auto verdict)", "")
+                return "Benign (auto verdict)"
             
             # Unknown status.
             if "this file is not yet rated" in lower_result:
-                return ("Unknown", "")
+                return "Unknown"
             
             # Default case.
-            return ("Unknown (Result)", "")
+            return "Unknown (Result)"
         else:
-            return ("Unknown (API error)", "")
+            return "Unknown (API error)"
     except Exception as ex:
-        return ("Error: {}".format(ex), "")
+        return "Error: {}".format(ex)
 
 def local_analysis(file_path, file_data):
     """
@@ -181,16 +99,16 @@ def local_analysis(file_path, file_data):
 
 def notify_user(file_path, virus_name=""):
     """
-    Sends a desktop notification for a malware detection.
-    If virus_name is empty, it is not included in the message.
+    Sends a desktop notification for a malware detection using win10toast.
     """
-    notification = Notify()
-    notification.title = "Malware Alert"
+    toaster = ToastNotifier()
+    title = "Malware Alert"
     if virus_name:
-        notification.message = "Malicious file quarantined:\n{}\nVirus: {}".format(file_path, virus_name)
+        message = "Malicious file quarantined:\n{}\nVirus: {}".format(file_path, virus_name)
     else:
-        notification.message = "Malicious file quarantined:\n{}".format(file_path)
-    notification.send()
+        message = "Malicious file quarantined:\n{}".format(file_path)
+    # duration is in seconds; adjust as needed.
+    toaster.show_toast(title, message, duration=10)
 
 # Quarantine folder path.
 QUARANTINE_FOLDER = os.path.join(os.getcwd(), "quarantine")
@@ -199,23 +117,18 @@ def scan_and_quarantine(file_path):
     """
     Scans the file by calculating its MD5 hash and querying the cloud.
     If the risk level is Malware, the file is quarantined.
-    Returns a tuple: (is_malware, virus_or_risk)
-      - For Malware, virus_or_risk is the virus name (if available) or "Malware".
-      - For Suspicious files, returns (False, "Suspicious") (or with the virus name if provided).
-      - For other cases, returns (False, risk) where risk can be benign, unknown, etc.
+    Returns a tuple: (is_malware, status)
     """
     file_hash, file_data = calculate_file_hash(file_path)
     if not file_hash:
-        return (False, "")
+        return (False, "Clean (Empty file)")
     
-    risk, virus_name = query_md5_online_sync(file_hash)
-
-    # For safe or unknown statuses (including Suspicious), do not quarantine.
-    if risk in ["Benign", "Benign (auto verdict)", "Suspicious", "Unknown", "Unknown (Result)", "Unknown (API error)"] or risk.startswith("Error"):
-        return (False, virus_name if virus_name else risk)
+    risk_result = query_md5_online_sync(file_hash)
+    if risk_result.startswith("Benign") or risk_result.startswith("Suspicious") or risk_result.startswith("Unknown") or risk_result.startswith("Error"):
+        return (False, risk_result)
     
-    # If the risk is Malware, proceed with quarantine.
-    if risk == "Malware":
+    # If risk_result indicates Malware, then proceed with quarantine.
+    if "Malware" in risk_result:
         if not os.path.exists(QUARANTINE_FOLDER):
             os.makedirs(QUARANTINE_FOLDER)
         base_name = os.path.basename(file_path)
@@ -223,43 +136,31 @@ def scan_and_quarantine(file_path):
         try:
             shutil.move(file_path, quarantine_path)
             logging.info("Malicious file quarantined: {} -> {}".format(file_path, quarantine_path))
-            update_quarantine_record(file_path, quarantine_path, virus_name if virus_name else "Malware")
         except Exception as e:
             logging.error("Failed to quarantine {}: {}".format(file_path, e))
-        return (True, virus_name if virus_name else "Malware")
+        return (True, risk_result)
     
-    # Fallback.
-    return (False, "")
+    return (False, risk_result)
 
 # ----------------- Worker Thread for Scanning -----------------
-class ScanWorker(QThread):
-    # Signals for each file category:
-    file_malicious = Signal(str)
-    file_clean = Signal(str)
-    file_unknown = Signal(str)
-    file_suspicious = Signal(str)
-    progress_update = Signal(int)
-    current_file = Signal(str)
-    scanned_count = Signal(int, int)
-    scan_complete_counts = Signal(int, int, int, int)
-    scan_finished = Signal()
-
-    def __init__(self, folder_path):
-        super(ScanWorker, self).__init__()
+class ScanWorker(threading.Thread):
+    """
+    Worker thread to scan a folder.
+    Communicates with the main thread via a thread-safe queue.
+    """
+    def __init__(self, folder_path, queue):
+        threading.Thread.__init__(self)
         self.folder_path = folder_path
-        self._is_stopped = False
-        self._paused = False
-        self.mutex = QMutex()
-        self.pause_condition = QWaitCondition()
+        self.queue = queue
+        self.stop_event = threading.Event()
+        self.pause_event = threading.Event()  # When set, scanning is paused.
 
     def run(self):
         total_files = 0
         for root, _, files in os.walk(self.folder_path):
             total_files += len(files)
         if total_files == 0:
-            self.scan_complete_counts.emit(0, 0, 0, 0)
-            self.scanned_count.emit(0, 0)
-            self.scan_finished.emit()
+            self.queue.put({'type': 'scan_complete', 'data': (0, 0, 0, 0)})
             return
 
         clean_count = 0
@@ -270,29 +171,32 @@ class ScanWorker(QThread):
 
         for root, _, files in os.walk(self.folder_path):
             for file in files:
-                self.mutex.lock()
-                while self._paused:
-                    self.pause_condition.wait(self.mutex)
-                self.mutex.unlock()
+                if self.stop_event.is_set():
+                    self.queue.put({'type': 'scan_aborted'})
+                    return
 
-                if self._is_stopped:
-                    break
+                # Pause handling:
+                while self.pause_event.is_set():
+                    time.sleep(0.1)
+                    if self.stop_event.is_set():
+                        self.queue.put({'type': 'scan_aborted'})
+                        return
 
                 file_path = os.path.join(root, file)
                 file_hash, file_data = calculate_file_hash(file_path)
                 if file_hash is None:
                     clean_count += 1
                     message = "Clean File (Empty): {}".format(file_path)
-                    self.file_clean.emit(message)
+                    self.queue.put({'type': 'update_clean', 'data': message})
                     scanned_files += 1
-                    self.scanned_count.emit(scanned_files, total_files)
-                    self.progress_update.emit(int((scanned_files / total_files) * 100))
+                    self.queue.put({'type': 'update_progress', 'data': (scanned_files, total_files)})
                     continue
 
                 risk_result = query_md5_online_sync(file_hash)
-                self.current_file.emit("{} -> {}".format(file_path, risk_result))
-
+                current_status = "{} -> {}".format(file_path, risk_result)
+                self.queue.put({'type': 'current_file', 'data': current_status})
                 local_info = local_analysis(file_path, file_data)
+
                 if risk_result.startswith("Benign"):
                     clean_count += 1
                     message = ("Clean File Detected:\n"
@@ -301,7 +205,7 @@ class ScanWorker(QThread):
                                "{}\n"
                                "Status: {}\n"
                                "{}").format(file_path, file_hash, local_info, risk_result, "-" * 50)
-                    self.file_clean.emit(message)
+                    self.queue.put({'type': 'update_clean', 'data': message})
                 elif risk_result.startswith("Malware"):
                     malicious_count += 1
                     message = ("Malicious File Detected:\n"
@@ -310,7 +214,7 @@ class ScanWorker(QThread):
                                "{}\n"
                                "Status: {}\n"
                                "{}").format(file_path, file_hash, local_info, risk_result, "-" * 50)
-                    self.file_malicious.emit(message)
+                    self.queue.put({'type': 'update_malicious', 'data': message})
                 elif risk_result.startswith("Suspicious"):
                     suspicious_count += 1
                     message = ("Suspicious File Detected:\n"
@@ -319,7 +223,7 @@ class ScanWorker(QThread):
                                "{}\n"
                                "Status: {}\n"
                                "{}").format(file_path, file_hash, local_info, risk_result, "-" * 50)
-                    self.file_suspicious.emit(message)
+                    self.queue.put({'type': 'update_suspicious', 'data': message})
                 else:
                     unknown_count += 1
                     message = ("Unknown File Detected:\n"
@@ -328,45 +232,34 @@ class ScanWorker(QThread):
                                "{}\n"
                                "Status: {}\n"
                                "{}").format(file_path, file_hash, local_info, risk_result, "-" * 50)
-                    self.file_unknown.emit(message)
+                    self.queue.put({'type': 'update_unknown', 'data': message})
 
                 scanned_files += 1
-                self.scanned_count.emit(scanned_files, total_files)
-                self.progress_update.emit(int((scanned_files / total_files) * 100))
-            if self._is_stopped:
-                break
-
-        self.scan_complete_counts.emit(unknown_count, malicious_count, clean_count, suspicious_count)
-        self.scan_finished.emit()
-
-    def stop(self):
-        self._is_stopped = True
-        self.resume()
+                self.queue.put({'type': 'update_progress', 'data': (scanned_files, total_files)})
+        # Send final counts.
+        self.queue.put({'type': 'scan_complete', 'data': (unknown_count, malicious_count, clean_count, suspicious_count)})
 
     def pause(self):
-        self.mutex.lock()
-        self._paused = True
-        self.mutex.unlock()
+        self.pause_event.set()
 
     def resume(self):
-        self.mutex.lock()
-        self._paused = False
-        self.pause_condition.wakeAll()
-        self.mutex.unlock()
+        self.pause_event.clear()
+
+    def stop(self):
+        self.stop_event.set()
+        self.resume()  # In case we are paused, let the thread exit.
 
 # ----------------- Real-Time Monitoring Thread -----------------
-class MonitorThread(QThread):
+class MonitorThread(threading.Thread):
     """
     Monitors a directory for changes using Windows API.
     When a file is modified or created, it scans the file.
-    If malware is detected, it is auto-quarantined and a signal is emitted.
     """
-    malware_detected = Signal(str, str)  # file_path, virus_name
-
-    def __init__(self, monitor_folder):
-        super(MonitorThread, self).__init__()
+    def __init__(self, monitor_folder, queue):
+        threading.Thread.__init__(self)
         self.monitor_folder = monitor_folder
-        self._stopped = False
+        self.queue = queue
+        self.stop_event = threading.Event()
 
     def run(self):
         if not os.path.exists(self.monitor_folder):
@@ -384,7 +277,7 @@ class MonitorThread(QThread):
         )
 
         try:
-            while not self._stopped:
+            while not self.stop_event.is_set():
                 results = win32file.ReadDirectoryChangesW(
                     hDir,
                     1024,
@@ -402,9 +295,10 @@ class MonitorThread(QThread):
                     pathToScan = os.path.join(self.monitor_folder, file)
                     if os.path.exists(pathToScan):
                         logging.info("Real-time detected change: {}".format(pathToScan))
-                        is_malware, virus_name = scan_and_quarantine(pathToScan)
+                        is_malware, risk_result = scan_and_quarantine(pathToScan)
                         if is_malware:
-                            self.malware_detected.emit(pathToScan, virus_name)
+                            # Send a message to update the malicious list.
+                            self.queue.put({'type': 'monitor_malware', 'data': (pathToScan, risk_result)})
                     else:
                         logging.warning("File or folder not found: {}".format(pathToScan))
         except Exception as ex:
@@ -413,131 +307,24 @@ class MonitorThread(QThread):
             win32file.CloseHandle(hDir)
 
     def stop(self):
-        self._stopped = True
+        self.stop_event.set()
 
 # ----------------- Main Application Window -----------------
-class MainWindow(QMainWindow):
+class MainApplication(tk.Tk):
     def __init__(self):
-        super(MainWindow, self).__init__()
-        self.setWindowTitle("Professional Antivirus Cloud Scanner")
-        # Set application icon.
-        self.setWindowIcon(QIcon("assets\\HydraDragonAV.ico"))
+        tk.Tk.__init__(self)
+        self.title("Haci Murad Antivirus Cloud Scanner")
+        self.geometry("1200x750")
 
-        self.central_widget = QWidget()
-        self.setCentralWidget(self.central_widget)
-        self.main_layout = QVBoxLayout(self.central_widget)
+        # Setup logging.
+        logging.basicConfig(level=logging.INFO)
 
-        # Top control buttons.
-        top_button_layout = QHBoxLayout()
-        self.select_folder_button = QPushButton("Select Folder")
-        self.select_folder_button.clicked.connect(self.select_folder)
-        top_button_layout.addWidget(self.select_folder_button)
+        # Create a thread-safe queue for inter-thread communication.
+        self.queue = queue.Queue()
 
-        self.start_scan_button = QPushButton("Start Scan")
-        self.start_scan_button.clicked.connect(self.start_scan)
-        self.start_scan_button.setEnabled(False)
-        top_button_layout.addWidget(self.start_scan_button)
-
-        self.pause_scan_button = QPushButton("Pause Scan")
-        self.pause_scan_button.clicked.connect(self.pause_scan)
-        self.pause_scan_button.setEnabled(False)
-        top_button_layout.addWidget(self.pause_scan_button)
-
-        self.resume_scan_button = QPushButton("Resume Scan")
-        self.resume_scan_button.clicked.connect(self.resume_scan)
-        self.resume_scan_button.setEnabled(False)
-        top_button_layout.addWidget(self.resume_scan_button)
-
-        self.stop_scan_button = QPushButton("Stop Scan")
-        self.stop_scan_button.clicked.connect(self.stop_scan)
-        self.stop_scan_button.setEnabled(False)
-        top_button_layout.addWidget(self.stop_scan_button)
-        
-        # Instead of asking to remove viruses, we now offer an "Open Quarantine" button.
-        self.remove_virus_button = QPushButton("Open Quarantine")
-        self.remove_virus_button.clicked.connect(self.open_quarantine_folder)
-        self.remove_virus_button.setEnabled(False)
-        top_button_layout.addWidget(self.remove_virus_button)
-        
-        # Toggle button for real-time monitoring.
-        self.monitor_button = QPushButton("Start Monitoring")
-        self.monitor_button.setCheckable(True)
-        self.monitor_button.clicked.connect(self.toggle_monitoring)
-        top_button_layout.addWidget(self.monitor_button)
-
-        self.main_layout.addLayout(top_button_layout)
-
-        # Folder label.
-        self.folder_label = QLabel("Selected Folder: None")
-        self.main_layout.addWidget(self.folder_label)
-
-        # Current file label.
-        self.current_file_label = QLabel("Current File: N/A")
-        self.main_layout.addWidget(self.current_file_label)
-
-        # Scanned file count label.
-        self.scanned_count_label = QLabel("Scanned: 0 / 0")
-        self.main_layout.addWidget(self.scanned_count_label)
-
-        # Scanning animation.
-        self.animation_label = QLabel(alignment=Qt.AlignCenter)
-        try:
-            self.movie = QMovie("assets\\spinner.gif")
-            if self.movie.isValid():
-                self.animation_label.setMovie(self.movie)
-            else:
-                self.animation_label.setText("Scanning...")
-        except Exception:
-            self.animation_label.setText("Scanning...")
-        self.animation_label.hide()
-        self.main_layout.addWidget(self.animation_label)
-
-        # Progress bar.
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setValue(0)
-        self.main_layout.addWidget(self.progress_bar)
-
-        # Group box with four lists: Malicious, Clean, Suspicious, Unknown.
-        self.result_group = QGroupBox("Scan Results")
-        self.result_layout = QGridLayout()
-        self.result_group.setLayout(self.result_layout)
-        self.main_layout.addWidget(self.result_group)
-
-        self.malicious_list = QListWidget()
-        self.result_layout.addWidget(QLabel("Malicious Files"), 0, 0)
-        self.result_layout.addWidget(self.malicious_list, 1, 0)
-
-        self.clean_list = QListWidget()
-        self.result_layout.addWidget(QLabel("Clean Files"), 0, 1)
-        self.result_layout.addWidget(self.clean_list, 1, 1)
-
-        self.suspicious_list = QListWidget()
-        self.result_layout.addWidget(QLabel("Suspicious Files"), 0, 2)
-        self.result_layout.addWidget(self.suspicious_list, 1, 2)
-
-        self.unknown_list = QListWidget()
-        self.result_layout.addWidget(QLabel("Unknown Files"), 0, 3)
-        self.result_layout.addWidget(self.unknown_list, 1, 3)
-
-        # Live summary label.
-        self.summary_label = QLabel("")
-        self.main_layout.addWidget(self.summary_label)
-
-        # Totals group.
-        self.totals_group = QGroupBox("Totals")
-        totals_layout = QHBoxLayout()
-        self.label_total_scanned = QLabel("Total Scanned: 0")
-        self.label_total_malicious = QLabel("Malicious: 0")
-        self.label_total_clean = QLabel("Clean: 0")
-        self.label_total_suspicious = QLabel("Suspicious: 0")
-        self.label_total_unknown = QLabel("Unknown: 0")
-        totals_layout.addWidget(self.label_total_scanned)
-        totals_layout.addWidget(self.label_total_malicious)
-        totals_layout.addWidget(self.label_total_clean)
-        totals_layout.addWidget(self.label_total_suspicious)
-        totals_layout.addWidget(self.label_total_unknown)
-        self.totals_group.setLayout(totals_layout)
-        self.main_layout.addWidget(self.totals_group)
+        # Initialize thread variables.
+        self.scan_thread = None
+        self.monitor_thread = None
 
         # Initialize counters.
         self.count_malicious = 0
@@ -549,228 +336,302 @@ class MainWindow(QMainWindow):
         # List to store quarantined file paths.
         self.malicious_files = []
 
-        self.scan_worker = None
-        self.monitor_thread = None
         self.selected_folder = None
 
+        # --- Top Controls ---
+        top_frame = tk.Frame(self)
+        top_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+
+        self.select_folder_button = tk.Button(top_frame, text="Select Folder", command=self.select_folder)
+        self.select_folder_button.pack(side=tk.LEFT, padx=2)
+
+        self.start_scan_button = tk.Button(top_frame, text="Start Scan", command=self.start_scan, state=tk.DISABLED)
+        self.start_scan_button.pack(side=tk.LEFT, padx=2)
+
+        self.pause_scan_button = tk.Button(top_frame, text="Pause Scan", command=self.pause_scan, state=tk.DISABLED)
+        self.pause_scan_button.pack(side=tk.LEFT, padx=2)
+
+        self.resume_scan_button = tk.Button(top_frame, text="Resume Scan", command=self.resume_scan, state=tk.DISABLED)
+        self.resume_scan_button.pack(side=tk.LEFT, padx=2)
+
+        self.stop_scan_button = tk.Button(top_frame, text="Stop Scan", command=self.stop_scan, state=tk.DISABLED)
+        self.stop_scan_button.pack(side=tk.LEFT, padx=2)
+
+        self.open_quarantine_button = tk.Button(top_frame, text="Open Quarantine", command=self.open_quarantine, state=tk.DISABLED)
+        self.open_quarantine_button.pack(side=tk.LEFT, padx=2)
+
+        self.monitoring = False
+        self.monitor_button = tk.Button(top_frame, text="Start Monitoring", command=self.toggle_monitoring)
+        self.monitor_button.pack(side=tk.LEFT, padx=2)
+
+        # --- Folder and Status Labels ---
+        status_frame = tk.Frame(self)
+        status_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+
+        self.folder_label = tk.Label(status_frame, text="Selected Folder: None")
+        self.folder_label.pack(side=tk.TOP, anchor="w")
+
+        self.current_file_label = tk.Label(status_frame, text="Current File: N/A")
+        self.current_file_label.pack(side=tk.TOP, anchor="w")
+
+        self.scanned_count_label = tk.Label(status_frame, text="Scanned: 0 / 0")
+        self.scanned_count_label.pack(side=tk.TOP, anchor="w")
+
+        # --- Progress Bar ---
+        progress_frame = tk.Frame(self)
+        progress_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+        self.progress_var = tk.IntVar()
+        self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100)
+        self.progress_bar.pack(fill=tk.X, padx=5)
+
+        # --- Results Lists ---
+        results_frame = tk.Frame(self)
+        results_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Create four listboxes for Malicious, Clean, Suspicious, Unknown.
+        self.malicious_list = tk.Listbox(results_frame)
+        self.clean_list = tk.Listbox(results_frame)
+        self.suspicious_list = tk.Listbox(results_frame)
+        self.unknown_list = tk.Listbox(results_frame)
+
+        # Arrange them in a grid.
+        tk.Label(results_frame, text="Malicious Files").grid(row=0, column=0)
+        tk.Label(results_frame, text="Clean Files").grid(row=0, column=1)
+        tk.Label(results_frame, text="Suspicious Files").grid(row=0, column=2)
+        tk.Label(results_frame, text="Unknown Files").grid(row=0, column=3)
+
+        self.malicious_list.grid(row=1, column=0, sticky="nsew", padx=2, pady=2)
+        self.clean_list.grid(row=1, column=1, sticky="nsew", padx=2, pady=2)
+        self.suspicious_list.grid(row=1, column=2, sticky="nsew", padx=2, pady=2)
+        self.unknown_list.grid(row=1, column=3, sticky="nsew", padx=2, pady=2)
+
+        # Make columns expand equally.
+        results_frame.grid_columnconfigure(0, weight=1)
+        results_frame.grid_columnconfigure(1, weight=1)
+        results_frame.grid_columnconfigure(2, weight=1)
+        results_frame.grid_columnconfigure(3, weight=1)
+
+        # --- Totals Summary ---
+        totals_frame = tk.Frame(self)
+        totals_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+        self.total_scanned_label = tk.Label(totals_frame, text="Total Scanned: 0")
+        self.total_scanned_label.pack(side=tk.LEFT, padx=2)
+        self.total_malicious_label = tk.Label(totals_frame, text="Malicious: 0")
+        self.total_malicious_label.pack(side=tk.LEFT, padx=2)
+        self.total_clean_label = tk.Label(totals_frame, text="Clean: 0")
+        self.total_clean_label.pack(side=tk.LEFT, padx=2)
+        self.total_suspicious_label = tk.Label(totals_frame, text="Suspicious: 0")
+        self.total_suspicious_label.pack(side=tk.LEFT, padx=2)
+        self.total_unknown_label = tk.Label(totals_frame, text="Unknown: 0")
+        self.total_unknown_label.pack(side=tk.LEFT, padx=2)
+
+        # --- Start the periodic check for queue messages ---
+        self.after(100, self.process_queue)
+
+    # --- Button Callback Methods ---
     def select_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Folder to Scan")
+        folder = filedialog.askdirectory(title="Select Folder to Scan")
         if folder:
             self.selected_folder = folder
-            self.folder_label.setText("Selected Folder: {}".format(folder))
-            self.start_scan_button.setEnabled(True)
-            self.malicious_list.clear()
-            self.clean_list.clear()
-            self.suspicious_list.clear()
-            self.unknown_list.clear()
-            self.progress_bar.setValue(0)
-            self.current_file_label.setText("Current File: N/A")
-            self.scanned_count_label.setText("Scanned: 0 / 0")
-            self.summary_label.setText("")
-            self.count_malicious = 0
-            self.count_clean = 0
-            self.count_unknown = 0
-            self.count_suspicious = 0
-            self.total_scanned = 0
-            self.malicious_files = []
-            self.update_totals()
-            self.remove_virus_button.setEnabled(False)
-            self.log("Folder selected: " + folder)
+            self.folder_label.config(text="Selected Folder: {}".format(folder))
+            self.start_scan_button.config(state=tk.NORMAL)
+            self.malicious_list.delete(0, tk.END)
+            self.clean_list.delete(0, tk.END)
+            self.suspicious_list.delete(0, tk.END)
+            self.unknown_list.delete(0, tk.END)
+            self.progress_var.set(0)
+            self.current_file_label.config(text="Current File: N/A")
+            self.scanned_count_label.config(text="Scanned: 0 / 0")
+            self.reset_counts()
+            self.open_quarantine_button.config(state=tk.DISABLED)
+            logging.info("Folder selected: " + folder)
 
     def start_scan(self):
         if not self.selected_folder:
-            QMessageBox.warning(self, "No Folder Selected", "Please select a folder first.")
+            messagebox.showwarning("No Folder Selected", "Please select a folder first.")
             return
 
-        self.malicious_list.clear()
-        self.clean_list.clear()
-        self.suspicious_list.clear()
-        self.unknown_list.clear()
-        self.progress_bar.setValue(0)
-        self.current_file_label.setText("Current File: N/A")
-        self.scanned_count_label.setText("Scanned: 0 / 0")
-        self.summary_label.setText("")
-        self.animation_label.show()
-        if hasattr(self, "movie") and self.movie.isValid():
-            self.movie.start()
+        # Clear previous lists and counters.
+        self.malicious_list.delete(0, tk.END)
+        self.clean_list.delete(0, tk.END)
+        self.suspicious_list.delete(0, tk.END)
+        self.unknown_list.delete(0, tk.END)
+        self.progress_var.set(0)
+        self.current_file_label.config(text="Current File: N/A")
+        self.scanned_count_label.config(text="Scanned: 0 / 0")
+        self.reset_counts()
 
-        self.scan_worker = ScanWorker(self.selected_folder)
-        self.scan_worker.file_malicious.connect(self.update_malicious)
-        self.scan_worker.file_clean.connect(self.update_clean)
-        self.scan_worker.file_unknown.connect(self.update_unknown)
-        self.scan_worker.file_suspicious.connect(self.update_suspicious)
-        self.scan_worker.progress_update.connect(self.progress_bar.setValue)
-        self.scan_worker.current_file.connect(self.update_current_file)
-        self.scan_worker.scanned_count.connect(self.update_scanned_count)
-        self.scan_worker.scan_complete_counts.connect(self.update_summary)
-        self.scan_worker.scan_finished.connect(self.scan_complete)
+        # Disable buttons during scan.
+        self.start_scan_button.config(state=tk.DISABLED)
+        self.select_folder_button.config(state=tk.DISABLED)
+        self.stop_scan_button.config(state=tk.NORMAL)
+        self.pause_scan_button.config(state=tk.NORMAL)
+        self.resume_scan_button.config(state=tk.DISABLED)
+        self.open_quarantine_button.config(state=tk.DISABLED)
 
-        self.start_scan_button.setEnabled(False)
-        self.select_folder_button.setEnabled(False)
-        self.stop_scan_button.setEnabled(True)
-        self.pause_scan_button.setEnabled(True)
-        self.resume_scan_button.setEnabled(False)
-        self.remove_virus_button.setEnabled(False)
-
-        self.scan_worker.start()
-        self.log("Scan started...")
+        # Start the scan worker thread.
+        self.scan_thread = ScanWorker(self.selected_folder, self.queue)
+        self.scan_thread.start()
+        logging.info("Scan started...")
 
     def pause_scan(self):
-        if self.scan_worker:
-            self.scan_worker.pause()
-            self.current_file_label.setText("Current File: Paused...")
-            self.pause_scan_button.setEnabled(False)
-            self.resume_scan_button.setEnabled(True)
-            self.log("Scan paused.")
+        if self.scan_thread:
+            self.scan_thread.pause()
+            self.current_file_label.config(text="Current File: Paused...")
+            self.pause_scan_button.config(state=tk.DISABLED)
+            self.resume_scan_button.config(state=tk.NORMAL)
+            logging.info("Scan paused.")
 
     def resume_scan(self):
-        if self.scan_worker:
-            self.scan_worker.resume()
-            self.current_file_label.setText("Current File: Resumed")
-            self.pause_scan_button.setEnabled(True)
-            self.resume_scan_button.setEnabled(False)
-            self.log("Scan resumed.")
+        if self.scan_thread:
+            self.scan_thread.resume()
+            self.current_file_label.config(text="Current File: Resumed")
+            self.pause_scan_button.config(state=tk.NORMAL)
+            self.resume_scan_button.config(state=tk.DISABLED)
+            logging.info("Scan resumed.")
 
     def stop_scan(self):
-        if self.scan_worker is not None:
-            self.scan_worker.stop()
-            self.stop_scan_button.setEnabled(False)
-            self.pause_scan_button.setEnabled(False)
-            self.resume_scan_button.setEnabled(False)
-            self.current_file_label.setText("Current File: Stopping...")
-            self.log("Scan stopping...")
+        if self.scan_thread:
+            self.scan_thread.stop()
+            self.stop_scan_button.config(state=tk.DISABLED)
+            self.pause_scan_button.config(state=tk.DISABLED)
+            self.resume_scan_button.config(state=tk.DISABLED)
+            self.current_file_label.config(text="Current File: Stopping...")
+            logging.info("Scan stopping...")
 
-    def update_malicious(self, message):
-        self.count_malicious += 1
-        self.malicious_list.addItem(message)
-        self.malicious_list.scrollToBottom()
-        self.update_live_summary()
-        # Extract file path from the message.
-        for line in message.splitlines():
-            if line.startswith("Path: "):
-                file_path = line.replace("Path: ", "").strip()
-                self.malicious_files.append(file_path)
-                break
+    def open_quarantine(self):
+        quarantine_folder = QUARANTINE_FOLDER
+        if not os.path.exists(quarantine_folder):
+            messagebox.showinfo("Quarantine", "No quarantine folder exists.")
+            return
+        try:
+            os.startfile(quarantine_folder)
+            logging.info("Opened quarantine folder.")
+        except Exception as e:
+            logging.error("Failed to open quarantine folder: {}".format(e))
 
-    def update_clean(self, message):
-        self.count_clean += 1
-        self.clean_list.addItem(message)
-        self.clean_list.scrollToBottom()
-        self.update_live_summary()
+    def toggle_monitoring(self):
+        if not self.selected_folder:
+            messagebox.showwarning("No Folder Selected", "Please select a folder first.")
+            return
 
-    def update_unknown(self, message):
-        self.count_unknown += 1
-        self.unknown_list.addItem(message)
-        self.unknown_list.scrollToBottom()
-        self.update_live_summary()
+        if not self.monitoring:
+            # Start monitoring.
+            self.monitor_thread = MonitorThread(self.selected_folder, self.queue)
+            self.monitor_thread.start()
+            self.monitor_button.config(text="Stop Monitoring")
+            self.monitoring = True
+            logging.info("Real-time monitoring started.")
+        else:
+            # Stop monitoring.
+            if self.monitor_thread:
+                self.monitor_thread.stop()
+                self.monitor_thread.join()
+                self.monitor_thread = None
+            self.monitor_button.config(text="Start Monitoring")
+            self.monitoring = False
+            logging.info("Real-time monitoring stopped.")
 
-    def update_suspicious(self, message):
-        self.count_suspicious += 1
-        self.suspicious_list.addItem(message)
-        self.suspicious_list.scrollToBottom()
-        self.update_live_summary()
-
-    def update_live_summary(self):
-        live_summary = ("Live Scan Summary: Malicious: {}, Clean: {}, Suspicious: {}, Unknown: {}"
-                        .format(self.count_malicious, self.count_clean, self.count_suspicious, self.count_unknown))
-        self.summary_label.setText(live_summary)
+    def reset_counts(self):
+        self.count_malicious = 0
+        self.count_clean = 0
+        self.count_unknown = 0
+        self.count_suspicious = 0
+        self.total_scanned = 0
+        self.malicious_files = []
         self.update_totals()
 
     def update_totals(self):
-        self.label_total_malicious.setText("Malicious: {}".format(self.count_malicious))
-        self.label_total_clean.setText("Clean: {}".format(self.count_clean))
-        self.label_total_suspicious.setText("Suspicious: {}".format(self.count_suspicious))
-        self.label_total_unknown.setText("Unknown: {}".format(self.count_unknown))
-        self.label_total_scanned.setText("Total Scanned: {}".format(self.total_scanned))
+        self.total_scanned_label.config(text="Total Scanned: {}".format(self.total_scanned))
+        self.total_malicious_label.config(text="Malicious: {}".format(self.count_malicious))
+        self.total_clean_label.config(text="Clean: {}".format(self.count_clean))
+        self.total_suspicious_label.config(text="Suspicious: {}".format(self.count_suspicious))
+        self.total_unknown_label.config(text="Unknown: {}".format(self.count_unknown))
 
-    def update_current_file(self, status):
-        self.current_file_label.setText("Current File: {}".format(status))
+    # --- Queue Processing ---
+    def process_queue(self):
+        try:
+            while True:
+                msg = self.queue.get_nowait()
+                mtype = msg.get('type')
+                data = msg.get('data')
+                if mtype == 'update_malicious':
+                    self.count_malicious += 1
+                    self.malicious_list.insert(tk.END, data)
+                    # Attempt to extract the file path from the message.
+                    for line in data.splitlines():
+                        if line.startswith("Path: "):
+                            file_path = line.replace("Path: ", "").strip()
+                            self.malicious_files.append(file_path)
+                            break
+                elif mtype == 'update_clean':
+                    self.count_clean += 1
+                    self.clean_list.insert(tk.END, data)
+                elif mtype == 'update_suspicious':
+                    self.count_suspicious += 1
+                    self.suspicious_list.insert(tk.END, data)
+                elif mtype == 'update_unknown':
+                    self.count_unknown += 1
+                    self.unknown_list.insert(tk.END, data)
+                elif mtype == 'update_progress':
+                    scanned, total = data
+                    self.total_scanned = scanned
+                    self.scanned_count_label.config(text="Scanned: {} / {}".format(scanned, total))
+                    percent = int((scanned / float(total)) * 100)
+                    self.progress_var.set(percent)
+                    self.update_totals()
+                elif mtype == 'current_file':
+                    self.current_file_label.config(text="Current File: {}".format(data))
+                elif mtype == 'scan_complete':
+                    # data = (unknown_count, malicious_count, clean_count, suspicious_count)
+                    unknown_count, malicious_count, clean_count, suspicious_count = data
+                    summary = ("Final Scan Summary: Malicious: {}, Clean: {}, Suspicious: {}, Unknown: {}"
+                               .format(malicious_count, clean_count, suspicious_count, unknown_count))
+                    self.current_file_label.config(text="Scan complete!")
+                    self.malicious_list.insert(tk.END, "Scan complete!")
+                    self.clean_list.insert(tk.END, "Scan complete!")
+                    self.suspicious_list.insert(tk.END, "Scan complete!")
+                    self.unknown_list.insert(tk.END, "Scan complete!")
+                    logging.info(summary)
+                    # Enable buttons after scan.
+                    self.start_scan_button.config(state=tk.NORMAL)
+                    self.select_folder_button.config(state=tk.NORMAL)
+                    self.stop_scan_button.config(state=tk.DISABLED)
+                    self.pause_scan_button.config(state=tk.DISABLED)
+                    self.resume_scan_button.config(state=tk.DISABLED)
+                    if self.malicious_files:
+                        self.open_quarantine_button.config(state=tk.NORMAL)
+                elif mtype == 'scan_aborted':
+                    self.current_file_label.config(text="Scan Aborted")
+                    self.start_scan_button.config(state=tk.NORMAL)
+                    self.select_folder_button.config(state=tk.NORMAL)
+                    self.stop_scan_button.config(state=tk.DISABLED)
+                    self.pause_scan_button.config(state=tk.DISABLED)
+                    self.resume_scan_button.config(state=tk.DISABLED)
+                    logging.info("Scan aborted.")
+                elif mtype == 'monitor_malware':
+                    # data = (file_path, virus_info)
+                    file_path, virus_info = data
+                    message = "Malicious file auto-quarantined: {} ({})".format(file_path, virus_info)
+                    self.malicious_list.insert(tk.END, message)
+                    notify_user(file_path, virus_info)
+                    logging.info("Real-time malware detection: " + message)
+                self.queue.task_done()
+        except queue.Empty:
+            pass
+        # Check the queue again after 100 ms.
+        self.after(100, self.process_queue)
 
-    def update_scanned_count(self, scanned, total):
-        self.total_scanned = scanned
-        self.scanned_count_label.setText("Scanned: {} / {}".format(scanned, total))
-        self.update_totals()
-
-    def update_summary(self, unknown_count, malicious_count, clean_count, suspicious_count):
-        final_summary = ("Final Scan Summary: Malicious: {}, Clean: {}, Suspicious: {}, Unknown: {}"
-                         .format(malicious_count, clean_count, suspicious_count, unknown_count))
-        self.summary_label.setText(final_summary)
-        self.count_malicious = malicious_count
-        self.count_clean = clean_count
-        self.count_unknown = unknown_count
-        self.count_suspicious = suspicious_count
-        self.update_totals()
-
-    def scan_complete(self):
-        self.current_file_label.setText("Current File: N/A")
-        self.progress_bar.setValue(100)
-        self.animation_label.hide()
-        if hasattr(self, "movie") and self.movie.isValid():
-            self.movie.stop()
-        # Enable the "Open Quarantine" button if any files have been quarantined.
-        if self.malicious_files:
-            self.remove_virus_button.setEnabled(True)
-        self.start_scan_button.setEnabled(True)
-        self.select_folder_button.setEnabled(True)
-        self.stop_scan_button.setEnabled(False)
-        self.pause_scan_button.setEnabled(False)
-        self.resume_scan_button.setEnabled(False)
-        if self.scan_worker._is_stopped:
-            self.summary_label.setText(self.summary_label.text() + " (Scan Aborted)")
-        self.malicious_list.addItem("Scan complete!")
-        self.clean_list.addItem("Scan complete!")
-        self.suspicious_list.addItem("Scan complete!")
-        self.unknown_list.addItem("Scan complete!")
-        self.log("Scan complete.")
-
-    def open_quarantine_folder(self):
-        """Open the quarantine folder using the default file explorer."""
-        quarantine_folder = os.path.join(os.getcwd(), "quarantine")
-        if not os.path.exists(quarantine_folder):
-            QMessageBox.information(self, "Quarantine", "No quarantine folder exists.")
-            return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(quarantine_folder))
-        self.log("Opened quarantine folder.")
-
-    def toggle_monitoring(self):
-        if self.monitor_button.isChecked():
-            if not self.selected_folder:
-                QMessageBox.warning(self, "No Folder Selected", "Please select a folder first.")
-                self.monitor_button.setChecked(False)
-                return
-            self.log("Starting real-time monitoring...")
-            self.monitor_thread = MonitorThread(self.selected_folder)
-            self.monitor_thread.malware_detected.connect(self.on_malware_detected)
-            self.monitor_thread.start()
-            self.monitor_button.setText("Stop Monitoring")
-        else:
-            if self.monitor_thread:
-                self.monitor_thread.stop()
-                self.monitor_thread.wait()
-                self.monitor_thread = None
-            self.log("Real-time monitoring stopped.")
-            self.monitor_button.setText("Start Monitoring")
-
-    def on_malware_detected(self, file_path, virus_name):
-        message = "Malicious file auto-quarantined: {}".format(file_path)
-        if virus_name:
-            message += " (Virus: {})".format(virus_name)
-        self.malicious_list.addItem(message)
-        self.malicious_list.scrollToBottom()
-        notify_user(file_path, virus_name)
-        self.log("Real-time malware detection: " + message)
-
-    def log(self, message):
-        # Simple logging helper.
-        print(message)
-        logging.info(message)
+    def on_close(self):
+        # Stop any running threads.
+        if self.scan_thread:
+            self.scan_thread.stop()
+        if self.monitor_thread:
+            self.monitor_thread.stop()
+        self.destroy()
 
 # ----------------- Main Execution -----------------
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    app = QApplication(sys.argv)
-    app.setStyleSheet(antivirus_style)
-    window = MainWindow()
-    window.resize(1200, 750)
-    window.show()
-    sys.exit(app.exec())
+    app = MainApplication()
+    app.protocol("WM_DELETE_WINDOW", app.on_close)
+    app.mainloop()

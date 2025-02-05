@@ -1,8 +1,5 @@
-# GUI Framework
-PyQt5
-
 # Windows API for directory monitoring
-pywin32
+pywin32 #Minimum is python 3.5 so I need to drop support for PyQt5
 
 # Notifications
 notify-py
