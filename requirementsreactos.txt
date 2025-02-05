@@ -1,5 +1,5 @@
 # GUI Framework
-PySide2
+PyQt5
 
 # Windows API for directory monitoring
 pywin32

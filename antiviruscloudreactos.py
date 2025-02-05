@@ -12,13 +12,13 @@ import logging
 import win32file
 import win32con
 
-from PySide2.QtWidgets import (
+from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QPushButton, QFileDialog,
     QListWidget, QLabel, QMessageBox, QHBoxLayout, QProgressBar, QGroupBox, QGridLayout
 )
-from PySide2.QtCore import QThread, Signal, Qt, QMutex, QWaitCondition, QUrl
-from PySide2.QtGui import QMovie, QIcon
-from PySide2.QtGui import QDesktopServices
+from PyQt5.QtCore import QThread, Signal, Qt, QMutex, QWaitCondition, QUrl
+from PyQt5.QtGui import QMovie, QIcon
+from PyQt5.QtGui import QDesktopServices
 
 # For desktop notifications.
 from notifypy import Notify
