@@ -9,6 +9,3 @@ notify-py
 
 # File handling and hashing
 requests
-
-# Logging (built-in but included for completeness)
-logging
