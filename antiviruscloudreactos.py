@@ -369,15 +369,13 @@ class ScanWorker(threading.Thread):
         self.resume()
 
 # ----------------- Real-Time Monitoring Thread -----------------
-import win32file
-import win32con
-# Some file change constants might be imported or defined elsewhere:
+# Custom flags for directory changes
 FILE_NOTIFY_CHANGE_LAST_ACCESS = 0x00000020
 FILE_NOTIFY_CHANGE_CREATION = 0x00000040
 FILE_NOTIFY_CHANGE_EA = 0x00000080
-FILE_NOTIFY_CHANGE_STREAM_NAME = 0x00000800
-FILE_NOTIFY_CHANGE_STREAM_SIZE = 0x00001000
-FILE_NOTIFY_CHANGE_STREAM_WRITE = 0x00002000
+FILE_NOTIFY_CHANGE_STREAM_NAME = 0x00000200
+FILE_NOTIFY_CHANGE_STREAM_SIZE = 0x00000400
+FILE_NOTIFY_CHANGE_STREAM_WRITE = 0x00000800
 
 class MonitorThread(threading.Thread):
     """

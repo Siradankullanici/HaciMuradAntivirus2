@@ -8,3 +8,4 @@ then do install python get-pip.py
 ### Notice
 - This fully cloud based antivirus based on NictaSoft. Old partner of Comodo.
 - This demo of full antivirus product. If you using ReactOS I recommend you use this with ClamSentiel.
+- It's fully cloud based and no file was uploaded except hash.
