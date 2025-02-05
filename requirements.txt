@@ -1,0 +1,14 @@
+# GUI Framework
+PySide6
+
+# Windows API for directory monitoring
+pywin32
+
+# Notifications
+notifypy
+
+# File handling and hashing
+requests
+
+# Logging (built-in but included for completeness)
+logging
