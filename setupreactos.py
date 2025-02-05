@@ -25,6 +25,8 @@ build_exe_options = {
         "tkinter",
     ],
     "include_files": [
+        (r"C:\Belgeler ve Ayarlar\Yönetici\Masaüstü\python-3.5.0-winxp\python35\DLLs\tk86t.dll", "tk86t.dll"),
+        (r"C:\Belgeler ve Ayarlar\Yönetici\Masaüstü\python-3.5.0-winxp\python35\DLLs\tcl86t.dll", "tcl86t.dll"),
         (tcl_dir, "tcl"),
         (tk_dir, "tk"),
     ],
