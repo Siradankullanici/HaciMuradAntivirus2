@@ -127,7 +127,7 @@ def query_md5_online_sync(md5_hash):
     """
     try:
         md5_hash_upper = md5_hash.upper()
-        url = f"https://www.nictasoft.com/ace/md5/{md5_hash_upper}"
+        url = "https://www.nictasoft.com/ace/md5/{}".format(md5_hash_upper)
         response = requests.get(url)
 
         if response.status_code == 200:
@@ -165,7 +165,7 @@ def query_md5_online_sync(md5_hash):
         else:
             return ("Unknown (API error)", "")
     except Exception as ex:
-        return (f"Error: {ex}", "")
+        return ("Error: {}".format(ex), "")
 
 def local_analysis(file_path, file_data):
     """
@@ -175,9 +175,9 @@ def local_analysis(file_path, file_data):
     try:
         file_name = os.path.basename(file_path)
         file_type, _ = mimetypes.guess_type(file_path)
-        return f"Name: {file_name} | Type: {file_type if file_type else 'Unknown'}"
+        return "Name: {} | Type: {}".format(file_name, file_type if file_type else 'Unknown')
     except Exception as e:
-        return f"Local analysis error: {e}"
+        return "Local analysis error: {}".format(e)
 
 def notify_user(file_path, virus_name=""):
     """
@@ -187,10 +187,13 @@ def notify_user(file_path, virus_name=""):
     notification = Notify()
     notification.title = "Malware Alert"
     if virus_name:
-        notification.message = f"Malicious file quarantined:\n{file_path}\nVirus: {virus_name}"
+        notification.message = "Malicious file quarantined:\n{}\nVirus: {}".format(file_path, virus_name)
     else:
-        notification.message = f"Malicious file quarantined:\n{file_path}"
+        notification.message = "Malicious file quarantined:\n{}".format(file_path)
     notification.send()
+
+# Quarantine folder path.
+QUARANTINE_FOLDER = os.path.join(os.getcwd(), "quarantine")
 
 def scan_and_quarantine(file_path):
     """
@@ -219,10 +222,10 @@ def scan_and_quarantine(file_path):
         quarantine_path = os.path.join(QUARANTINE_FOLDER, base_name)
         try:
             shutil.move(file_path, quarantine_path)
-            logging.info(f"Malicious file quarantined: {file_path} -> {quarantine_path}")
+            logging.info("Malicious file quarantined: {} -> {}".format(file_path, quarantine_path))
             update_quarantine_record(file_path, quarantine_path, virus_name if virus_name else "Malware")
         except Exception as e:
-            logging.error(f"Failed to quarantine {file_path}: {e}")
+            logging.error("Failed to quarantine {}: {}".format(file_path, e))
         return (True, virus_name if virus_name else "Malware")
     
     # Fallback.
@@ -242,7 +245,7 @@ class ScanWorker(QThread):
     scan_finished = Signal()
 
     def __init__(self, folder_path):
-        super().__init__()
+        super(ScanWorker, self).__init__()
         self.folder_path = folder_path
         self._is_stopped = False
         self._paused = False
@@ -279,7 +282,7 @@ class ScanWorker(QThread):
                 file_hash, file_data = calculate_file_hash(file_path)
                 if file_hash is None:
                     clean_count += 1
-                    message = f"Clean File (Empty): {file_path}"
+                    message = "Clean File (Empty): {}".format(file_path)
                     self.file_clean.emit(message)
                     scanned_files += 1
                     self.scanned_count.emit(scanned_files, total_files)
@@ -287,52 +290,44 @@ class ScanWorker(QThread):
                     continue
 
                 risk_result = query_md5_online_sync(file_hash)
-                self.current_file.emit(f"{file_path} -> {risk_result}")
+                self.current_file.emit("{} -> {}".format(file_path, risk_result))
 
                 local_info = local_analysis(file_path, file_data)
                 if risk_result.startswith("Benign"):
                     clean_count += 1
-                    message = (
-                        f"Clean File Detected:\n"
-                        f"Path: {file_path}\n"
-                        f"MD5: {file_hash}\n"
-                        f"{local_info}\n"
-                        f"Status: {risk_result}\n"
-                        f"{'-'*50}"
-                    )
+                    message = ("Clean File Detected:\n"
+                               "Path: {}\n"
+                               "MD5: {}\n"
+                               "{}\n"
+                               "Status: {}\n"
+                               "{}").format(file_path, file_hash, local_info, risk_result, "-" * 50)
                     self.file_clean.emit(message)
                 elif risk_result.startswith("Malware"):
                     malicious_count += 1
-                    message = (
-                        f"Malicious File Detected:\n"
-                        f"Path: {file_path}\n"
-                        f"MD5: {file_hash}\n"
-                        f"{local_info}\n"
-                        f"Status: {risk_result}\n"
-                        f"{'-'*50}"
-                    )
+                    message = ("Malicious File Detected:\n"
+                               "Path: {}\n"
+                               "MD5: {}\n"
+                               "{}\n"
+                               "Status: {}\n"
+                               "{}").format(file_path, file_hash, local_info, risk_result, "-" * 50)
                     self.file_malicious.emit(message)
                 elif risk_result.startswith("Suspicious"):
                     suspicious_count += 1
-                    message = (
-                        f"Suspicious File Detected:\n"
-                        f"Path: {file_path}\n"
-                        f"MD5: {file_hash}\n"
-                        f"{local_info}\n"
-                        f"Status: {risk_result}\n"
-                        f"{'-'*50}"
-                    )
+                    message = ("Suspicious File Detected:\n"
+                               "Path: {}\n"
+                               "MD5: {}\n"
+                               "{}\n"
+                               "Status: {}\n"
+                               "{}").format(file_path, file_hash, local_info, risk_result, "-" * 50)
                     self.file_suspicious.emit(message)
                 else:
                     unknown_count += 1
-                    message = (
-                        f"Unknown File Detected:\n"
-                        f"Path: {file_path}\n"
-                        f"MD5: {file_hash}\n"
-                        f"{local_info}\n"
-                        f"Status: {risk_result}\n"
-                        f"{'-'*50}"
-                    )
+                    message = ("Unknown File Detected:\n"
+                               "Path: {}\n"
+                               "MD5: {}\n"
+                               "{}\n"
+                               "Status: {}\n"
+                               "{}").format(file_path, file_hash, local_info, risk_result, "-" * 50)
                     self.file_unknown.emit(message)
 
                 scanned_files += 1
@@ -369,13 +364,13 @@ class MonitorThread(QThread):
     malware_detected = Signal(str, str)  # file_path, virus_name
 
     def __init__(self, monitor_folder):
-        super().__init__()
+        super(MonitorThread, self).__init__()
         self.monitor_folder = monitor_folder
         self._stopped = False
 
     def run(self):
         if not os.path.exists(self.monitor_folder):
-            logging.error(f"The monitor folder path does not exist: {self.monitor_folder}")
+            logging.error("The monitor folder path does not exist: {}".format(self.monitor_folder))
             return
 
         hDir = win32file.CreateFile(
@@ -406,14 +401,14 @@ class MonitorThread(QThread):
                 for action, file in results:
                     pathToScan = os.path.join(self.monitor_folder, file)
                     if os.path.exists(pathToScan):
-                        logging.info(f"Real-time detected change: {pathToScan}")
+                        logging.info("Real-time detected change: {}".format(pathToScan))
                         is_malware, virus_name = scan_and_quarantine(pathToScan)
                         if is_malware:
                             self.malware_detected.emit(pathToScan, virus_name)
                     else:
-                        logging.warning(f"File or folder not found: {pathToScan}")
+                        logging.warning("File or folder not found: {}".format(pathToScan))
         except Exception as ex:
-            logging.error(f"An error occurred in MonitorThread: {ex}")
+            logging.error("An error occurred in MonitorThread: {}".format(ex))
         finally:
             win32file.CloseHandle(hDir)
 
@@ -423,7 +418,7 @@ class MonitorThread(QThread):
 # ----------------- Main Application Window -----------------
 class MainWindow(QMainWindow):
     def __init__(self):
-        super().__init__()
+        super(MainWindow, self).__init__()
         self.setWindowTitle("Professional Antivirus Cloud Scanner")
         # Set application icon.
         self.setWindowIcon(QIcon("assets\\HydraDragonAV.ico"))
@@ -562,7 +557,7 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder to Scan")
         if folder:
             self.selected_folder = folder
-            self.folder_label.setText(f"Selected Folder: {folder}")
+            self.folder_label.setText("Selected Folder: {}".format(folder))
             self.start_scan_button.setEnabled(True)
             self.malicious_list.clear()
             self.clean_list.clear()
@@ -676,34 +671,29 @@ class MainWindow(QMainWindow):
         self.update_live_summary()
 
     def update_live_summary(self):
-        live_summary = (
-            f"Live Scan Summary: Malicious: {self.count_malicious}, "
-            f"Clean: {self.count_clean}, Suspicious: {self.count_suspicious}, "
-            f"Unknown: {self.count_unknown}"
-        )
+        live_summary = ("Live Scan Summary: Malicious: {}, Clean: {}, Suspicious: {}, Unknown: {}"
+                        .format(self.count_malicious, self.count_clean, self.count_suspicious, self.count_unknown))
         self.summary_label.setText(live_summary)
         self.update_totals()
 
     def update_totals(self):
-        self.label_total_malicious.setText(f"Malicious: {self.count_malicious}")
-        self.label_total_clean.setText(f"Clean: {self.count_clean}")
-        self.label_total_suspicious.setText(f"Suspicious: {self.count_suspicious}")
-        self.label_total_unknown.setText(f"Unknown: {self.count_unknown}")
-        self.label_total_scanned.setText(f"Total Scanned: {self.total_scanned}")
+        self.label_total_malicious.setText("Malicious: {}".format(self.count_malicious))
+        self.label_total_clean.setText("Clean: {}".format(self.count_clean))
+        self.label_total_suspicious.setText("Suspicious: {}".format(self.count_suspicious))
+        self.label_total_unknown.setText("Unknown: {}".format(self.count_unknown))
+        self.label_total_scanned.setText("Total Scanned: {}".format(self.total_scanned))
 
     def update_current_file(self, status):
-        self.current_file_label.setText(f"Current File: {status}")
+        self.current_file_label.setText("Current File: {}".format(status))
 
     def update_scanned_count(self, scanned, total):
         self.total_scanned = scanned
-        self.scanned_count_label.setText(f"Scanned: {scanned} / {total}")
+        self.scanned_count_label.setText("Scanned: {} / {}".format(scanned, total))
         self.update_totals()
 
     def update_summary(self, unknown_count, malicious_count, clean_count, suspicious_count):
-        final_summary = (
-            f"Final Scan Summary: Malicious: {malicious_count}, Clean: {clean_count}, "
-            f"Suspicious: {suspicious_count}, Unknown: {unknown_count}"
-        )
+        final_summary = ("Final Scan Summary: Malicious: {}, Clean: {}, Suspicious: {}, Unknown: {}"
+                         .format(malicious_count, clean_count, suspicious_count, unknown_count))
         self.summary_label.setText(final_summary)
         self.count_malicious = malicious_count
         self.count_clean = clean_count
@@ -762,9 +752,9 @@ class MainWindow(QMainWindow):
             self.monitor_button.setText("Start Monitoring")
 
     def on_malware_detected(self, file_path, virus_name):
-        message = f"Malicious file auto-quarantined: {file_path}"
+        message = "Malicious file auto-quarantined: {}".format(file_path)
         if virus_name:
-            message += f" (Virus: {virus_name})"
+            message += " (Virus: {})".format(virus_name)
         self.malicious_list.addItem(message)
         self.malicious_list.scrollToBottom()
         notify_user(file_path, virus_name)
