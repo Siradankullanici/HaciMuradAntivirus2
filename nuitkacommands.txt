@@ -1,0 +1,1 @@
+python -m nuitka --standalone --onefile --enable-plugin=tk-inter --windows-disable-console antiviruscloudreactos.py
