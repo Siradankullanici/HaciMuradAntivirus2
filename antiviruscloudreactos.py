@@ -278,7 +278,6 @@ class ScanWorker(threading.Thread):
             for file in files:
                 full_path = os.path.join(root, file)
                 file_paths.append(full_path)
-                logging.debug("Found file: %s", full_path)
 
         total_files = len(file_paths)
         logging.info("Total files found: %d", total_files)
