@@ -33,7 +33,7 @@ if not os.path.exists(log_directory):
 application_log_file = os.path.join(log_directory, "antivirus.log")
 logging.basicConfig(
     filename=application_log_file,
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
@@ -268,14 +268,22 @@ class ScanWorker(threading.Thread):
         self.hash_cache = {}         # Cache: { file_hash: result_dict }
         self.cache_lock = threading.Lock()  # Protects access to hash_cache
 
+        logging.info("ScanWorker initialized for folder: %s with max_workers=%s", self.folder_path, self.max_workers)
+
     def run(self):
+        logging.info("ScanWorker started scanning folder: %s", self.folder_path)
         # Gather all file paths from the folder (and subfolders)
         file_paths = []
         for root, dirs, files in os.walk(self.folder_path):
             for file in files:
-                file_paths.append(os.path.join(root, file))
+                full_path = os.path.join(root, file)
+                file_paths.append(full_path)
+                logging.debug("Found file: %s", full_path)
+
         total_files = len(file_paths)
+        logging.info("Total files found: %d", total_files)
         if total_files == 0:
+            logging.info("No files to scan in folder: %s", self.folder_path)
             self.queue.put({'type': 'scan_complete', 'data': (0, 0, 0, 0)})
             return
 
@@ -288,13 +296,21 @@ class ScanWorker(threading.Thread):
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_path = {executor.submit(self.process_file, fp): fp for fp in file_paths}
+            logging.info("Submitted all file scanning tasks to the executor.")
+
             for future in as_completed(future_to_path):
                 if self.stop_event.is_set():
+                    logging.info("Stop event set. Aborting scan.")
                     self.queue.put({'type': 'scan_aborted'})
                     executor.shutdown(wait=False)
                     return
 
-                result = future.result()  # result is a dict with keys: 'type' and 'data'
+                try:
+                    result = future.result()  # result is a dict with keys: 'type' and 'data'
+                except Exception as e:
+                    logging.error("Error processing file: %s", e)
+                    continue
+
                 update_type = result.get("type")
                 data = result.get("data")
 
@@ -307,23 +323,38 @@ class ScanWorker(threading.Thread):
                 elif update_type == "update_unknown":
                     unknown_count += 1
 
+                logging.debug("Scan result for a file: %s", data)
                 self.queue.put(result)
                 scanned_files += 1
                 self.queue.put({'type': 'update_progress', 'data': (scanned_files, total_files)})
+                logging.info("Progress update: %d/%d files scanned.", scanned_files, total_files)
+
+        logging.info("Scan complete. Summary: Unknown: %d, Malicious: %d, Clean: %d, Suspicious: %d",
+                     unknown_count, malicious_count, clean_count, suspicious_count)
         self.queue.put({'type': 'scan_complete', 'data': (unknown_count, malicious_count, clean_count, suspicious_count)})
 
     def process_file(self, file_path):
+        logging.debug("Processing file: %s", file_path)
         # Pause support
         with self.pause_cond:
             while self.paused:
+                logging.info("ScanWorker paused. Waiting...")
                 self.pause_cond.wait()
             if self.stop_event.is_set():
+                logging.info("Stop event set while processing file: %s", file_path)
                 return {'type': 'skipped', 'data': "Scan aborted: {}".format(file_path)}
 
         # Calculate file hash and file data
-        file_hash, file_data = calculate_file_hash(file_path)
+        try:
+            file_hash, file_data = calculate_file_hash(file_path)
+            logging.debug("Calculated hash for %s: %s", file_path, file_hash)
+        except Exception as e:
+            logging.error("Error calculating hash for %s: %s", file_path, e)
+            return {'type': 'skipped', 'data': "Error calculating hash for {}".format(file_path)}
+
         if not file_hash:
             msg = "Clean File (Empty): {}".format(file_path)
+            logging.info("Empty file detected: %s", file_path)
             result = {'type': 'update_clean', 'data': msg}
             return result
 
@@ -331,13 +362,25 @@ class ScanWorker(threading.Thread):
         with self.cache_lock:
             if file_hash in self.hash_cache:
                 cached_result = self.hash_cache[file_hash]
-                # Optionally, update the current file info before returning
+                logging.info("Cache hit for file %s with hash %s", file_path, file_hash)
                 self.queue.put({'type': 'current_file', 'data': "{} -> Cached Result".format(file_path)})
                 return cached_result
 
         # Not in cache: perform the scan
-        risk_result = query_md5_online_sync(file_hash)
-        local_info = local_analysis(file_path, file_data)
+        try:
+            risk_result = query_md5_online_sync(file_hash)
+            logging.info("Query result for %s: %s", file_path, risk_result)
+        except Exception as e:
+            logging.error("Error querying MD5 online for %s: %s", file_path, e)
+            risk_result = "Unknown"
+
+        try:
+            local_info = local_analysis(file_path, file_data)
+            logging.debug("Local analysis for %s: %s", file_path, local_info)
+        except Exception as e:
+            logging.error("Error performing local analysis for %s: %s", file_path, e)
+            local_info = "No local analysis available."
+
         self.queue.put({'type': 'current_file', 'data': "{} -> {}".format(file_path, risk_result)})
 
         # Build the result message based on the scan outcome.
@@ -345,17 +388,19 @@ class ScanWorker(threading.Thread):
             msg = ("Clean File Detected:\nPath: {}\nMD5: {}\n{}\nStatus: {}\n{}"
                    .format(file_path, file_hash, local_info, risk_result, "-" * 50))
             result = {'type': 'update_clean', 'data': msg}
+            logging.info("File marked as clean: %s", file_path)
 
         elif risk_result.startswith("Malware"):
-            ensure_quarantine_folder()
-            quarantine_path = os.path.join(QUARANTINE_FOLDER, os.path.basename(file_path))
+            logging.warning("Malicious file detected: %s", file_path)
             try:
+                ensure_quarantine_folder()
+                quarantine_path = os.path.join(QUARANTINE_FOLDER, os.path.basename(file_path))
                 shutil.move(file_path, quarantine_path)
-                logging.info("Malicious file quarantined: {} -> {}".format(file_path, quarantine_path))
+                logging.info("Malicious file quarantined: %s -> %s", file_path, quarantine_path)
                 add_quarantine_record(file_path, risk_result, quarantine_path)
                 notify_user(file_path, risk_result)
             except Exception as e:
-                logging.error("Failed to quarantine {}: {}".format(file_path, e))
+                logging.error("Failed to quarantine %s: %s", file_path, e)
             msg = ("Malicious File Detected:\nPath: {}\nMD5: {}\n{}\nStatus: {}\n{}"
                    .format(file_path, file_hash, local_info, risk_result, "-" * 50))
             result = {'type': 'update_malicious', 'data': msg}
@@ -364,28 +409,34 @@ class ScanWorker(threading.Thread):
             msg = ("Suspicious File Detected:\nPath: {}\nMD5: {}\n{}\nStatus: {}\n{}"
                    .format(file_path, file_hash, local_info, risk_result, "-" * 50))
             result = {'type': 'update_suspicious', 'data': msg}
+            logging.info("File marked as suspicious: %s", file_path)
 
         else:
             msg = ("Unknown File Detected:\nPath: {}\nMD5: {}\n{}\nStatus: {}\n{}"
                    .format(file_path, file_hash, local_info, risk_result, "-" * 50))
             result = {'type': 'update_unknown', 'data': msg}
+            logging.info("File marked as unknown: %s", file_path)
 
         # Save the result in the cache for future reuse.
         with self.cache_lock:
             self.hash_cache[file_hash] = result
+            logging.debug("Cached result for file %s with hash %s", file_path, file_hash)
 
         return result
 
     def pause(self):
         with self.pause_cond:
             self.paused = True
+            logging.info("ScanWorker paused.")
 
     def resume(self):
         with self.pause_cond:
             self.paused = False
             self.pause_cond.notify_all()
+            logging.info("ScanWorker resumed.")
 
     def stop(self):
+        logging.info("Stop signal received for ScanWorker.")
         self.stop_event.set()
         self.resume()
 
@@ -401,7 +452,7 @@ FILE_NOTIFY_CHANGE_STREAM_WRITE = 0x00000800
 class MonitorThread(threading.Thread):
     """
     Monitors a directory for changes and processes changed files concurrently.
-    Also, scans all running processes using psutil, skipping files already scanned.
+    Also scans all running processes using psutil, skipping files already scanned.
     """
     def __init__(self, monitor_folder, queue, max_workers=200, process_scan_interval=30):
         threading.Thread.__init__(self)
@@ -418,20 +469,28 @@ class MonitorThread(threading.Thread):
         # Timestamp for scheduling process scans.
         self.last_process_scan_time = 0
 
+        logging.info("MonitorThread initialized for folder: %s", self.monitor_folder)
+
     def run(self):
+        logging.info("MonitorThread started.")
         if not os.path.exists(self.monitor_folder):
-            logging.error("Monitor folder not found: {}".format(self.monitor_folder))
+            logging.error("Monitor folder not found: %s", self.monitor_folder)
             return
 
-        hDir = win32file.CreateFile(
-            self.monitor_folder,
-            win32con.GENERIC_READ,
-            win32con.FILE_SHARE_READ | win32con.FILE_SHARE_WRITE | win32con.FILE_SHARE_DELETE,
-            None,
-            win32con.OPEN_EXISTING,
-            win32con.FILE_FLAG_BACKUP_SEMANTICS,
-            None
-        )
+        try:
+            hDir = win32file.CreateFile(
+                self.monitor_folder,
+                win32con.GENERIC_READ,
+                win32con.FILE_SHARE_READ | win32con.FILE_SHARE_WRITE | win32con.FILE_SHARE_DELETE,
+                None,
+                win32con.OPEN_EXISTING,
+                win32con.FILE_FLAG_BACKUP_SEMANTICS,
+                None
+            )
+            logging.info("Successfully opened directory handle for %s", self.monitor_folder)
+        except Exception as e:
+            logging.error("Failed to open directory handle for %s: %s", self.monitor_folder, e)
+            return
 
         change_flags = (
             win32con.FILE_NOTIFY_CHANGE_FILE_NAME |
@@ -452,7 +511,7 @@ class MonitorThread(threading.Thread):
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             try:
                 while not self.stop_event.is_set():
-                    # Monitor file system changes.
+                    logging.debug("Waiting for file system changes in %s", self.monitor_folder)
                     results = win32file.ReadDirectoryChangesW(
                         hDir,
                         1024,
@@ -461,64 +520,96 @@ class MonitorThread(threading.Thread):
                         None,
                         None
                     )
+                    logging.info("Detected %d change(s) in %s", len(results), self.monitor_folder)
                     for action, file in results:
                         path_to_scan = os.path.join(self.monitor_folder, file)
+                        logging.debug("Change detected: Action %s on file %s", action, path_to_scan)
                         if os.path.exists(path_to_scan):
-                            # Submit file scan in a separate thread.
+                            logging.info("Submitting file scan for: %s", path_to_scan)
                             executor.submit(self.process_changed_file, path_to_scan)
                         else:
-                            logging.warning("File not found: {}".format(path_to_scan))
+                            logging.warning("File not found: %s", path_to_scan)
 
                     # Always scan running processes.
+                    logging.info("Submitting process scan.")
                     executor.submit(self.scan_processes)
-
             except Exception as ex:
-                logging.error("Error in MonitorThread: {}".format(ex))
+                logging.error("Error in MonitorThread run loop: %s", ex)
             finally:
-                win32file.CloseHandle(hDir)
+                try:
+                    win32file.CloseHandle(hDir)
+                    logging.info("Closed directory handle for %s", self.monitor_folder)
+                except Exception as e:
+                    logging.error("Error closing directory handle: %s", e)
+
+        logging.info("MonitorThread exiting.")
 
     def process_changed_file(self, file_path):
         """
         Processes a file system change: compute its hash and query its risk status.
         If malware is detected, quarantine the file.
         """
-        file_hash, file_data = calculate_file_hash(file_path)
+        logging.debug("Processing changed file: %s", file_path)
+        try:
+            file_hash, file_data = calculate_file_hash(file_path)
+        except Exception as e:
+            logging.error("Error calculating hash for %s: %s", file_path, e)
+            return
+
         if not file_hash:
+            logging.warning("No hash computed for file: %s", file_path)
             return
 
         # Check the hash cache.
         with self.cache_lock:
             if file_hash in self.hash_cache:
                 risk_result = self.hash_cache[file_hash]
+                logging.info("Cache hit for %s: %s", file_path, risk_result)
                 self.queue.put({'type': 'current_file', 'data': "{} -> Cached Result".format(file_path)})
             else:
-                risk_result = query_md5_online_sync(file_hash)
+                logging.info("Cache miss for %s; querying risk online.", file_path)
+                try:
+                    risk_result = query_md5_online_sync(file_hash)
+                except Exception as e:
+                    logging.error("Error querying online for %s: %s", file_path, e)
+                    return
                 self.hash_cache[file_hash] = risk_result
                 self.queue.put({'type': 'current_file', 'data': "{} -> {}".format(file_path, risk_result)})
 
         # If malware is detected, quarantine the file.
         if risk_result.startswith("Malware"):
-            ensure_quarantine_folder()
-            quarantine_path = os.path.join(QUARANTINE_FOLDER, os.path.basename(file_path))
+            logging.warning("Malware detected in file: %s", file_path)
             try:
+                ensure_quarantine_folder()
+                quarantine_path = os.path.join(QUARANTINE_FOLDER, os.path.basename(file_path))
                 shutil.move(file_path, quarantine_path)
-                logging.info("Real-time: Malicious file quarantined: {} -> {}".format(file_path, quarantine_path))
+                logging.info("Real-time: Malicious file quarantined: %s -> %s", file_path, quarantine_path)
                 add_quarantine_record(file_path, risk_result, quarantine_path)
                 notify_user(file_path, risk_result)
             except Exception as e:
-                logging.error("Real-time: Failed to quarantine {}: {}".format(file_path, e))
+                logging.error("Real-time: Failed to quarantine %s: %s", file_path, e)
             self.queue.put({'type': 'monitor_malware', 'data': (file_path, risk_result)})
+        else:
+            logging.debug("File %s is clean: %s", file_path, risk_result)
 
     def scan_processes(self):
         """
         Always scan all running processes using psutil, but skip scanning
         files (executables) that have already been scanned.
         """
-        processes = list(psutil.process_iter(['pid', 'name', 'exe']))
+        logging.info("Starting scan of running processes.")
+        try:
+            processes = list(psutil.process_iter(['pid', 'name', 'exe']))
+        except Exception as e:
+            logging.error("Failed to retrieve processes: %s", e)
+            return
+
         # Use a small ThreadPoolExecutor for process scanning.
         with ThreadPoolExecutor(max_workers=10) as executor:
             for proc in processes:
+                logging.debug("Submitting scan for process: %s (PID: %s)", proc.info.get('name'), proc.info.get('pid'))
                 executor.submit(self.scan_process, proc)
+        logging.info("Completed submission of process scan tasks.")
 
     def scan_process(self, proc):
         """
@@ -527,22 +618,28 @@ class MonitorThread(threading.Thread):
         """
         try:
             exe_path = proc.info.get('exe')
-            # Skip processes with no executable path or non-existent files.
-            if not exe_path or not os.path.exists(exe_path):
+            if not exe_path:
+                logging.debug("Process %s (PID: %s) has no executable path; skipping.", proc.info.get('name'), proc.info.get('pid'))
+                return
+
+            if not os.path.exists(exe_path):
+                logging.debug("Executable path does not exist for process %s (PID: %s): %s", proc.info.get('name'), proc.info.get('pid'), exe_path)
                 return
 
             # Check if the file path is already in the cache.
             with self.cache_lock:
                 if exe_path in self.hash_cache:
                     risk_result = self.hash_cache[exe_path]
+                    logging.info("Cache hit for process executable %s: %s", exe_path, risk_result)
                     self.queue.put({'type': 'process_scan', 'data': "Cached: {} -> {}".format(exe_path, risk_result)})
                     return
 
-            # Compute the file hash.
+            logging.debug("Computing hash for process executable: %s", exe_path)
             file_hash, file_data = calculate_file_hash(exe_path)
             if not file_hash:
                 msg = ("Process {} (PID: {}): Unable to compute hash for {}"
                        .format(proc.info.get('name'), proc.info.get('pid'), exe_path))
+                logging.warning(msg)
                 self.queue.put({'type': 'process_scan', 'data': msg})
                 return
 
@@ -550,27 +647,36 @@ class MonitorThread(threading.Thread):
             with self.cache_lock:
                 if file_hash in self.hash_cache:
                     risk_result = self.hash_cache[file_hash]
+                    logging.info("Cache hit for hash %s of executable %s", file_hash, exe_path)
                 else:
-                    risk_result = query_md5_online_sync(file_hash)
+                    logging.info("Cache miss for hash %s of executable %s; querying risk.", file_hash, exe_path)
+                    try:
+                        risk_result = query_md5_online_sync(file_hash)
+                    except Exception as e:
+                        logging.error("Error querying online for process %s: %s", exe_path, e)
+                        return
                     # Cache both the hash and the file path.
                     self.hash_cache[file_hash] = risk_result
                     self.hash_cache[exe_path] = risk_result
 
             msg = ("Process: {} (PID: {}), Executable: {}\nRisk: {}"
                    .format(proc.info.get('name'), proc.info.get('pid'), exe_path, risk_result))
+            logging.info("Process scan result: %s", msg)
             self.queue.put({'type': 'process_scan', 'data': msg})
 
             # If the process's executable is flagged as malware, notify the user.
             if risk_result.startswith("Malware"):
+                logging.warning("Malware detected in process executable: %s", exe_path)
                 notify_user(exe_path, risk_result)
                 self.queue.put({'type': 'process_malware', 'data': msg})
-
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as specific_ex:
+            logging.debug("Process scanning skipped due to process exception: %s", specific_ex)
             return
         except Exception as e:
-            logging.error("Error scanning process {}: {}".format(proc, e))
+            logging.error("Error scanning process %s: %s", proc, e)
 
     def stop(self):
+        logging.info("Stop signal received for MonitorThread.")
         self.stop_event.set()
 
 # ----------------- Quarantine Manager Function -----------------
@@ -594,6 +700,7 @@ class MainApplication(tk.Tk):
         tk.Tk.__init__(self)
         self.title("Haci Murad Antivirus Cloud Scanner")
         self.geometry("700x370")
+        logging.info("Application started with title 'Haci Murad Antivirus Cloud Scanner'.")
 
         self.queue = queue.Queue()
         self.scan_thread = None
@@ -707,15 +814,20 @@ class MainApplication(tk.Tk):
         self.total_unknown_label.pack(side=tk.LEFT, padx=2)
 
         self.after(100, self.process_queue)
+        logging.info("UI initialized successfully.")
 
     def extract_filepath(self, text):
         """
         Tries to extract a file path from a given text by looking for a line that starts with "Path: ".
         Returns the file path if found, or the text stripped.
         """
+        logging.debug("Extracting file path from text.")
         for line in text.splitlines():
             if line.startswith("Path: "):
-                return line.replace("Path: ", "").strip()
+                file_path = line.replace("Path: ", "").strip()
+                logging.debug("Extracted file path: %s", file_path)
+                return file_path
+        logging.debug("No specific file path found, returning stripped text.")
         return text.strip()
 
     def on_list_right_click(self, event):
@@ -726,7 +838,9 @@ class MainApplication(tk.Tk):
             widget.selection_clear(0, tk.END)
             widget.selection_set(index)
             entry = widget.get(index)
-        except Exception:
+            logging.debug("Right-click on list item: %s", entry)
+        except Exception as e:
+            logging.error("Error handling right-click event: %s", e)
             return
         menu = tk.Menu(self, tearoff=0)
         menu.add_command(label="Delete", command=lambda: self.delete_selected_item(widget, index))
@@ -734,51 +848,60 @@ class MainApplication(tk.Tk):
         menu.add_command(label="Skip", command=lambda: self.skip_selected_item(widget, index))
         menu.tk_popup(event.x_root, event.y_root)
         menu.grab_release()
+        logging.debug("Context menu displayed for list item.")
 
     def delete_selected_item(self, lst, index):
         """Deletes the file corresponding to the selected item in the given list."""
         entry = lst.get(index)
         file_path = self.extract_filepath(entry)
+        logging.info("Attempting to delete file: %s", file_path)
         if file_path and os.path.exists(file_path):
             if messagebox.askyesno("Confirm Delete", "Are you sure you want to delete:\n{}".format(file_path)):
                 try:
                     os.remove(file_path)
                     messagebox.showinfo("Delete", "Deleted file:\n{}".format(file_path))
-                    logging.info("Deleted file: " + file_path)
+                    logging.info("Deleted file: %s", file_path)
                     lst.delete(index)
                 except Exception as e:
+                    logging.error("Failed to delete file %s: %s", file_path, e)
                     messagebox.showerror("Error", "Failed to delete file:\n{}\nError: {}".format(file_path, e))
         else:
+            logging.warning("File not found for deletion: %s", file_path)
             messagebox.showwarning("Not Found", "File does not exist:\n{}".format(file_path))
 
     def quarantine_selected_item(self, lst, index):
         """Moves the selected file into the quarantine folder."""
         entry = lst.get(index)
         file_path = self.extract_filepath(entry)
+        logging.info("Attempting to quarantine file: %s", file_path)
         if file_path and os.path.exists(file_path):
             if not os.path.exists(QUARANTINE_FOLDER):
                 os.makedirs(QUARANTINE_FOLDER)
+                logging.debug("Created quarantine folder: %s", QUARANTINE_FOLDER)
             quarantine_path = os.path.join(QUARANTINE_FOLDER, os.path.basename(file_path))
             if messagebox.askyesno("Confirm Quarantine", "Are you sure you want to quarantine:\n{}".format(file_path)):
                 try:
                     shutil.move(file_path, quarantine_path)
                     messagebox.showinfo("Quarantine", "File quarantined to:\n{}".format(quarantine_path))
-                    logging.info("File quarantined: {} -> {}".format(file_path, quarantine_path))
+                    logging.info("File quarantined: %s -> %s", file_path, quarantine_path)
                     lst.delete(index)
                 except Exception as e:
+                    logging.error("Failed to quarantine file %s: %s", file_path, e)
                     messagebox.showerror("Error", "Failed to quarantine file:\n{}\nError: {}".format(file_path, e))
         else:
+            logging.warning("File not found for quarantine: %s", file_path)
             messagebox.showwarning("Not Found", "File does not exist:\n{}".format(file_path))
 
     def skip_selected_item(self, lst, index):
         """Simply notifies the user that the file was skipped."""
         entry = lst.get(index)
         file_path = self.extract_filepath(entry)
+        logging.info("File skipped: %s", file_path)
         messagebox.showinfo("Skip", "File skipped:\n{}".format(file_path))
-        logging.info("File skipped: " + file_path)
 
     def delete_selected(self):
         """Deletes the file corresponding to the selected entry from any list."""
+        logging.info("Delete selected file triggered.")
         for lst in [self.malicious_list, self.clean_list, self.suspicious_list, self.unknown_list]:
             try:
                 index = lst.curselection()[0]
@@ -786,10 +909,12 @@ class MainApplication(tk.Tk):
                 return
             except IndexError:
                 continue
+        logging.warning("No file selected for deletion.")
         messagebox.showwarning("No Selection", "Please select a file from one of the lists first.")
 
     def quarantine_selected(self):
         """Manually moves the selected file into the quarantine folder."""
+        logging.info("Quarantine selected file triggered.")
         for lst in [self.malicious_list, self.clean_list, self.suspicious_list, self.unknown_list]:
             try:
                 index = lst.curselection()[0]
@@ -797,10 +922,12 @@ class MainApplication(tk.Tk):
                 return
             except IndexError:
                 continue
+        logging.warning("No file selected for quarantine.")
         messagebox.showwarning("No Selection", "Please select a file from one of the lists first.")
 
     def delete_all(self):
         """Deletes all files listed in all lists after confirmation."""
+        logging.info("Delete all files triggered.")
         all_files = []
         for lst in [self.malicious_list, self.clean_list, self.suspicious_list, self.unknown_list]:
             for i in range(lst.size()):
@@ -809,6 +936,7 @@ class MainApplication(tk.Tk):
                 if file_path and file_path not in all_files:
                     all_files.append(file_path)
         if not all_files:
+            logging.info("No files available to delete.")
             messagebox.showwarning("No Files", "No files to delete.")
             return
         if messagebox.askyesno("Confirm Delete All", "Are you sure you want to delete all files listed?"):
@@ -817,9 +945,10 @@ class MainApplication(tk.Tk):
                 if os.path.exists(file_path):
                     try:
                         os.remove(file_path)
-                        logging.info("Deleted file: " + file_path)
+                        logging.info("Deleted file: %s", file_path)
                     except Exception as e:
                         errors.append("Failed to delete {}: {}".format(file_path, e))
+                        logging.error("Failed to delete file %s: %s", file_path, e)
             if errors:
                 messagebox.showerror("Delete All Errors", "\n".join(errors))
             else:
@@ -831,6 +960,7 @@ class MainApplication(tk.Tk):
 
     def quarantine_all(self):
         """Moves all files listed in all lists to the quarantine folder after confirmation."""
+        logging.info("Quarantine all files triggered.")
         all_files = []
         for lst in [self.malicious_list, self.clean_list, self.suspicious_list, self.unknown_list]:
             for i in range(lst.size()):
@@ -839,20 +969,23 @@ class MainApplication(tk.Tk):
                 if file_path and file_path not in all_files:
                     all_files.append(file_path)
         if not all_files:
+            logging.info("No files available to quarantine.")
             messagebox.showwarning("No Files", "No files to quarantine.")
             return
         if messagebox.askyesno("Confirm Quarantine All", "Are you sure you want to quarantine all files listed?"):
             if not os.path.exists(QUARANTINE_FOLDER):
                 os.makedirs(QUARANTINE_FOLDER)
+                logging.debug("Created quarantine folder: %s", QUARANTINE_FOLDER)
             errors = []
             for file_path in all_files:
                 if os.path.exists(file_path):
                     quarantine_path = os.path.join(QUARANTINE_FOLDER, os.path.basename(file_path))
                     try:
                         shutil.move(file_path, quarantine_path)
-                        logging.info("File quarantined: {} -> {}".format(file_path, quarantine_path))
+                        logging.info("File quarantined: %s -> %s", file_path, quarantine_path)
                     except Exception as e:
                         errors.append("Failed to quarantine {}: {}".format(file_path, e))
+                        logging.error("Failed to quarantine file %s: %s", file_path, e)
             if errors:
                 messagebox.showerror("Quarantine All Errors", "\n".join(errors))
             else:
@@ -877,14 +1010,18 @@ class MainApplication(tk.Tk):
             self.scanned_count_label.config(text="Scanned: 0 / 0")
             self.reset_counts()
             self.open_quarantine_button.config(state=tk.DISABLED)
-            logging.info("Folder selected: " + folder)
+            logging.info("Folder selected: %s", folder)
+        else:
+            logging.info("No folder was selected.")
 
     def start_scan(self):
         if not self.selected_folder:
             messagebox.showwarning("No Folder Selected", "Please select a folder first.")
+            logging.warning("Start scan attempted with no folder selected.")
             return
 
         # Clear previous results
+        logging.info("Starting scan for folder: %s", self.selected_folder)
         self.malicious_list.delete(0, tk.END)
         self.clean_list.delete(0, tk.END)
         self.suspicious_list.delete(0, tk.END)
@@ -901,9 +1038,10 @@ class MainApplication(tk.Tk):
         self.resume_scan_button.config(state=tk.DISABLED)
         self.open_quarantine_button.config(state=tk.DISABLED)
 
-        self.scan_thread = ScanWorker(self.selected_folder, self.queue, self.hash_cache)
+        # If your ScanWorker accepts a hash cache parameter, adjust as needed.
+        self.scan_thread = ScanWorker(self.selected_folder, self.queue, max_workers=200)
         self.scan_thread.start()
-        logging.info("Scan started...")
+        logging.info("Scan thread started for folder: %s", self.selected_folder)
 
     def pause_scan(self):
         if self.scan_thread:
@@ -931,35 +1069,40 @@ class MainApplication(tk.Tk):
             logging.info("Scan stopping...")
 
     def open_quarantine(self):
+        logging.info("Open quarantine triggered.")
         if not os.path.exists(QUARANTINE_FOLDER):
             messagebox.showinfo("Quarantine", "No quarantine folder exists.")
+            logging.info("No quarantine folder exists.")
             return
         try:
             os.startfile(QUARANTINE_FOLDER)
-            logging.info("Opened quarantine folder.")
+            logging.info("Opened quarantine folder: %s", QUARANTINE_FOLDER)
         except Exception as e:
-            logging.error("Failed to open quarantine folder: {}".format(e))
+            logging.error("Failed to open quarantine folder: %s", e)
 
     def toggle_monitoring(self):
         if not self.selected_folder:
             messagebox.showwarning("No Folder Selected", "Please select a folder first.")
+            logging.warning("Monitoring toggle attempted with no folder selected.")
             return
         if not self.monitoring:
             self.monitor_thread = MonitorThread(self.selected_folder, self.queue)
             self.monitor_thread.start()
             self.monitor_button.config(text="Stop Monitoring")
             self.monitoring = True
-            logging.info("Real-time monitoring started.")
+            logging.info("Real-time monitoring started for folder: %s", self.selected_folder)
         else:
             if self.monitor_thread:
                 self.monitor_thread.stop()
                 self.monitor_thread.join()
                 self.monitor_thread = None
+                logging.info("Real-time monitoring thread stopped.")
             self.monitor_button.config(text="Start Monitoring")
             self.monitoring = False
-            logging.info("Real-time monitoring stopped.")
+            logging.info("Real-time monitoring toggled off.")
 
     def reset_counts(self):
+        logging.debug("Resetting counts.")
         self.count_malicious = 0
         self.count_clean = 0
         self.count_unknown = 0
@@ -974,6 +1117,8 @@ class MainApplication(tk.Tk):
         self.total_clean_label.config(text="Clean: {}".format(self.count_clean))
         self.total_suspicious_label.config(text="Suspicious: {}".format(self.count_suspicious))
         self.total_unknown_label.config(text="Unknown: {}".format(self.count_unknown))
+        logging.debug("Totals updated: Scanned=%d, Malicious=%d, Clean=%d, Suspicious=%d, Unknown=%d",
+                      self.total_scanned, self.count_malicious, self.count_clean, self.count_suspicious, self.count_unknown)
 
     def process_queue(self):
         try:
@@ -981,6 +1126,7 @@ class MainApplication(tk.Tk):
                 msg = self.queue.get_nowait()
                 mtype = msg.get("type")
                 data = msg.get("data")
+                logging.debug("Processing queue message: %s with data: %s", mtype, data)
                 if mtype == "update_malicious":
                     self.count_malicious += 1
                     self.malicious_list.insert(tk.END, data)
@@ -1017,7 +1163,7 @@ class MainApplication(tk.Tk):
                     self.clean_list.insert(tk.END, "Scan complete!")
                     self.suspicious_list.insert(tk.END, "Scan complete!")
                     self.unknown_list.insert(tk.END, "Scan complete!")
-                    logging.info(summary)
+                    logging.info("Scan complete. " + summary)
                     messagebox.showinfo("Scan Finished", summary)
                     self.start_scan_button.config(state=tk.NORMAL)
                     self.select_folder_button.config(state=tk.NORMAL)
@@ -1047,10 +1193,13 @@ class MainApplication(tk.Tk):
         self.after(100, self.process_queue)
 
     def on_close(self):
+        logging.info("Application closing.")
         if self.scan_thread:
             self.scan_thread.stop()
+            logging.info("Scan thread stopped.")
         if self.monitor_thread:
             self.monitor_thread.stop()
+            logging.info("Monitor thread stopped.")
         self.destroy()
 
 if __name__ == "__main__":
