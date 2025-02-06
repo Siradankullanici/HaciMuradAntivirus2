@@ -401,9 +401,7 @@ FILE_NOTIFY_CHANGE_STREAM_WRITE = 0x00000800
 class MonitorThread(threading.Thread):
     """
     Monitors a directory for changes and processes changed files concurrently.
-    Also, periodically scans all running processes using psutil.
-    Uses a hash cache (with locking) to avoid re-processing files whose scan results
-    have already been determined.
+    Also, scans all running processes using psutil, skipping files already scanned.
     """
     def __init__(self, monitor_folder, queue, max_workers=200, process_scan_interval=30):
         threading.Thread.__init__(self)
@@ -441,7 +439,7 @@ class MonitorThread(threading.Thread):
             win32con.FILE_NOTIFY_CHANGE_ATTRIBUTES |
             win32con.FILE_NOTIFY_CHANGE_SIZE |
             win32con.FILE_NOTIFY_CHANGE_LAST_WRITE |
-            win32con.FILE_NOTIFY_CHANGE_SECURITY |
+            win32con.FILE_NOTIFY_CHANGE_SECURITY | 
             FILE_NOTIFY_CHANGE_LAST_ACCESS |
             FILE_NOTIFY_CHANGE_CREATION |
             FILE_NOTIFY_CHANGE_EA |
@@ -464,18 +462,15 @@ class MonitorThread(threading.Thread):
                         None
                     )
                     for action, file in results:
-                        pathToScan = os.path.join(self.monitor_folder, file)
-                        if os.path.exists(pathToScan):
+                        path_to_scan = os.path.join(self.monitor_folder, file)
+                        if os.path.exists(path_to_scan):
                             # Submit file scan in a separate thread.
-                            executor.submit(self.process_changed_file, pathToScan)
+                            executor.submit(self.process_changed_file, path_to_scan)
                         else:
-                            logging.warning("File not found: {}".format(pathToScan))
+                            logging.warning("File not found: {}".format(path_to_scan))
 
-                    # Periodically scan running processes.
-                    current_time = time.time()
-                    if current_time - self.last_process_scan_time >= self.process_scan_interval:
-                        self.last_process_scan_time = current_time
-                        executor.submit(self.scan_processes)
+                    # Always scan running processes.
+                    executor.submit(self.scan_processes)
 
             except Exception as ex:
                 logging.error("Error in MonitorThread: {}".format(ex))
@@ -484,7 +479,7 @@ class MonitorThread(threading.Thread):
 
     def process_changed_file(self, file_path):
         """
-        Process a file system change: compute its hash and query its risk status.
+        Processes a file system change: compute its hash and query its risk status.
         If malware is detected, quarantine the file.
         """
         file_hash, file_data = calculate_file_hash(file_path)
@@ -516,9 +511,8 @@ class MonitorThread(threading.Thread):
 
     def scan_processes(self):
         """
-        Uses psutil to scan all running processes. For each process with an executable,
-        compute its hash and check its risk status using the shared hash cache.
-        If a process's executable is flagged as malware, notify the user.
+        Always scan all running processes using psutil, but skip scanning
+        files (executables) that have already been scanned.
         """
         processes = list(psutil.process_iter(['pid', 'name', 'exe']))
         # Use a small ThreadPoolExecutor for process scanning.
@@ -527,12 +521,24 @@ class MonitorThread(threading.Thread):
                 executor.submit(self.scan_process, proc)
 
     def scan_process(self, proc):
+        """
+        Scans a single process by computing its executable's hash and checking the risk.
+        Skips scanning files that have already been processed (using a hash cache).
+        """
         try:
             exe_path = proc.info.get('exe')
             # Skip processes with no executable path or non-existent files.
             if not exe_path or not os.path.exists(exe_path):
                 return
 
+            # Check if the file path is already in the cache.
+            with self.cache_lock:
+                if exe_path in self.hash_cache:
+                    risk_result = self.hash_cache[exe_path]
+                    self.queue.put({'type': 'process_scan', 'data': "Cached: {} -> {}".format(exe_path, risk_result)})
+                    return
+
+            # Compute the file hash.
             file_hash, file_data = calculate_file_hash(exe_path)
             if not file_hash:
                 msg = ("Process {} (PID: {}): Unable to compute hash for {}"
@@ -546,7 +552,9 @@ class MonitorThread(threading.Thread):
                     risk_result = self.hash_cache[file_hash]
                 else:
                     risk_result = query_md5_online_sync(file_hash)
+                    # Cache both the hash and the file path.
                     self.hash_cache[file_hash] = risk_result
+                    self.hash_cache[exe_path] = risk_result
 
             msg = ("Process: {} (PID: {}), Executable: {}\nRisk: {}"
                    .format(proc.info.get('name'), proc.info.get('pid'), exe_path, risk_result))
