@@ -369,9 +369,7 @@ class ScanWorker(threading.Thread):
         # Not in cache: perform the scan
         try:
             risk_result = query_md5_online_sync(file_hash)
-            logging.info("Query result for %s: %s", file_path, risk_result)
         except Exception as e:
-            logging.error("Error querying MD5 online for %s: %s", file_path, e)
             risk_result = "Unknown"
 
         try:
@@ -463,7 +461,7 @@ class MonitorThread(threading.Thread):
         self.process_scan_interval = process_scan_interval  # seconds between process scans
 
         # Initialize a hash cache and a lock for thread-safety.
-        self.hash_cache = {}  # Format: { file_hash: risk_result }
+        self.hash_cache = {}  # Format: { file_hash: risk_result, exe_path: risk_result }
         self.cache_lock = threading.Lock()
 
         # Timestamp for scheduling process scans.
@@ -507,7 +505,7 @@ class MonitorThread(threading.Thread):
             FILE_NOTIFY_CHANGE_STREAM_WRITE
         )
 
-        # Use a ThreadPoolExecutor for processing file changes.
+        # Use a ThreadPoolExecutor for processing file changes and process scans.
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             try:
                 while not self.stop_event.is_set():
@@ -604,33 +602,36 @@ class MonitorThread(threading.Thread):
             logging.error("Failed to retrieve processes: %s", e)
             return
 
-        # Use ThreadPoolExecutor for process scanning.
+        # Use a ThreadPoolExecutor for process scanning.
         with ThreadPoolExecutor(max_workers=200) as executor:
             for proc in processes:
                 try:
                     proc_info = proc.as_dict(attrs=['pid', 'name', 'exe'])
-                    logging.debug("Submitting scan for process: %s (PID: %s)", proc_info.get('name'),
-                                  proc_info.get('pid'))
-                    executor.submit(self.scan_process, proc)
+                    logging.debug("Submitting scan for process: %s (PID: %s)", 
+                                  proc_info.get('name'), proc_info.get('pid'))
+                    executor.submit(self.scan_process, proc_info)
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as e:
                     logging.debug("Skipping process due to error: %s", e)
                 except Exception as e:
                     logging.error("Error retrieving process info: %s", e)
         logging.info("Completed submission of process scan tasks.")
 
-    def scan_process(self, proc):
+    def scan_process(self, proc_info):
         """
         Scans a single process by computing its executable's hash and checking the risk.
         Skips scanning files that have already been processed (using a hash cache).
+        The parameter proc_info is a dictionary containing process details.
         """
         try:
-            exe_path = proc.info.get('exe')
+            exe_path = proc_info.get('exe')
             if not exe_path:
-                logging.debug("Process %s (PID: %s) has no executable path; skipping.", proc.info.get('name'), proc.info.get('pid'))
+                logging.debug("Process %s (PID: %s) has no executable path; skipping.",
+                              proc_info.get('name'), proc_info.get('pid'))
                 return
 
             if not os.path.exists(exe_path):
-                logging.debug("Executable path does not exist for process %s (PID: %s): %s", proc.info.get('name'), proc.info.get('pid'), exe_path)
+                logging.debug("Executable path does not exist for process %s (PID: %s): %s",
+                              proc_info.get('name'), proc_info.get('pid'), exe_path)
                 return
 
             # Check if the file path is already in the cache.
@@ -645,7 +646,7 @@ class MonitorThread(threading.Thread):
             file_hash, file_data = calculate_file_hash(exe_path)
             if not file_hash:
                 msg = ("Process {} (PID: {}): Unable to compute hash for {}"
-                       .format(proc.info.get('name'), proc.info.get('pid'), exe_path))
+                       .format(proc_info.get('name'), proc_info.get('pid'), exe_path))
                 logging.warning(msg)
                 self.queue.put({'type': 'process_scan', 'data': msg})
                 return
@@ -667,20 +668,24 @@ class MonitorThread(threading.Thread):
                     self.hash_cache[exe_path] = risk_result
 
             msg = ("Process: {} (PID: {}), Executable: {}\nRisk: {}"
-                   .format(proc.info.get('name'), proc.info.get('pid'), exe_path, risk_result))
+                   .format(proc_info.get('name'), proc_info.get('pid'), exe_path, risk_result))
             logging.info("Process scan result: %s", msg)
             self.queue.put({'type': 'process_scan', 'data': msg})
 
-            # If the process's executable is flagged as malware, notify the user.
+            # Notify user for malware or suspicious processes.
             if risk_result.startswith("Malware"):
                 logging.warning("Malware detected in process executable: %s", exe_path)
                 notify_user(exe_path, risk_result)
                 self.queue.put({'type': 'process_malware', 'data': msg})
+            elif risk_result.startswith("Suspicious"):
+                logging.warning("Suspicious result detected in process executable: %s", exe_path)
+                notify_user(exe_path, risk_result)
+                self.queue.put({'type': 'process_suspicious', 'data': msg})
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as specific_ex:
             logging.debug("Process scanning skipped due to process exception: %s", specific_ex)
             return
         except Exception as e:
-            logging.error("Error scanning process %s: %s", proc, e)
+            logging.error("Error scanning process %s: %s", proc_info, e)
 
     def stop(self):
         logging.info("Stop signal received for MonitorThread.")
