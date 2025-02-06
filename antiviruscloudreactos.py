@@ -439,7 +439,7 @@ class MonitorThread(threading.Thread):
             win32con.FILE_NOTIFY_CHANGE_ATTRIBUTES |
             win32con.FILE_NOTIFY_CHANGE_SIZE |
             win32con.FILE_NOTIFY_CHANGE_LAST_WRITE |
-            win32con.FILE_NOTIFY_CHANGE_SECURITY | 
+            win32con.FILE_NOTIFY_CHANGE_SECURITY |
             FILE_NOTIFY_CHANGE_LAST_ACCESS |
             FILE_NOTIFY_CHANGE_CREATION |
             FILE_NOTIFY_CHANGE_EA |
