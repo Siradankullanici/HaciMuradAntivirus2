@@ -6,3 +6,6 @@ notify-py
 
 # File handling and hashing
 requests
+
+# Processes
+psutil==3.4.2

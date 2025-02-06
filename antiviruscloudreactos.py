@@ -10,6 +10,7 @@ import logging
 import threading
 import queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import psutil
 
 import win32file
 import win32con
@@ -254,6 +255,7 @@ def scan_and_quarantine(file_path):
 class ScanWorker(threading.Thread):
     """
     Multi-threaded scan worker that uses a ThreadPoolExecutor to process files concurrently.
+    Now uses a hash cache to avoid re-scanning files whose results have already been determined.
     """
     def __init__(self, folder_path, queue, max_workers=200):
         threading.Thread.__init__(self)
@@ -263,6 +265,8 @@ class ScanWorker(threading.Thread):
         self.pause_cond = threading.Condition()
         self.paused = False
         self.max_workers = max_workers
+        self.hash_cache = {}         # Cache: { file_hash: result_dict }
+        self.cache_lock = threading.Lock()  # Protects access to hash_cache
 
     def run(self):
         # Gather all file paths from the folder (and subfolders)
@@ -316,19 +320,31 @@ class ScanWorker(threading.Thread):
             if self.stop_event.is_set():
                 return {'type': 'skipped', 'data': "Scan aborted: {}".format(file_path)}
 
+        # Calculate file hash and file data
         file_hash, file_data = calculate_file_hash(file_path)
         if not file_hash:
             msg = "Clean File (Empty): {}".format(file_path)
-            return {'type': 'update_clean', 'data': msg}
+            result = {'type': 'update_clean', 'data': msg}
+            return result
 
+        # Check if this file hash is already in our cache
+        with self.cache_lock:
+            if file_hash in self.hash_cache:
+                cached_result = self.hash_cache[file_hash]
+                # Optionally, update the current file info before returning
+                self.queue.put({'type': 'current_file', 'data': "{} -> Cached Result".format(file_path)})
+                return cached_result
+
+        # Not in cache: perform the scan
         risk_result = query_md5_online_sync(file_hash)
         local_info = local_analysis(file_path, file_data)
         self.queue.put({'type': 'current_file', 'data': "{} -> {}".format(file_path, risk_result)})
 
+        # Build the result message based on the scan outcome.
         if risk_result.startswith("Benign"):
             msg = ("Clean File Detected:\nPath: {}\nMD5: {}\n{}\nStatus: {}\n{}"
                    .format(file_path, file_hash, local_info, risk_result, "-" * 50))
-            return {'type': 'update_clean', 'data': msg}
+            result = {'type': 'update_clean', 'data': msg}
 
         elif risk_result.startswith("Malware"):
             ensure_quarantine_folder()
@@ -337,23 +353,28 @@ class ScanWorker(threading.Thread):
                 shutil.move(file_path, quarantine_path)
                 logging.info("Malicious file quarantined: {} -> {}".format(file_path, quarantine_path))
                 add_quarantine_record(file_path, risk_result, quarantine_path)
-                # Notify the user after successful quarantine
                 notify_user(file_path, risk_result)
             except Exception as e:
                 logging.error("Failed to quarantine {}: {}".format(file_path, e))
             msg = ("Malicious File Detected:\nPath: {}\nMD5: {}\n{}\nStatus: {}\n{}"
                    .format(file_path, file_hash, local_info, risk_result, "-" * 50))
-            return {'type': 'update_malicious', 'data': msg}
+            result = {'type': 'update_malicious', 'data': msg}
 
         elif risk_result.startswith("Suspicious"):
             msg = ("Suspicious File Detected:\nPath: {}\nMD5: {}\n{}\nStatus: {}\n{}"
                    .format(file_path, file_hash, local_info, risk_result, "-" * 50))
-            return {'type': 'update_suspicious', 'data': msg}
+            result = {'type': 'update_suspicious', 'data': msg}
 
         else:
             msg = ("Unknown File Detected:\nPath: {}\nMD5: {}\n{}\nStatus: {}\n{}"
                    .format(file_path, file_hash, local_info, risk_result, "-" * 50))
-            return {'type': 'update_unknown', 'data': msg}
+            result = {'type': 'update_unknown', 'data': msg}
+
+        # Save the result in the cache for future reuse.
+        with self.cache_lock:
+            self.hash_cache[file_hash] = result
+
+        return result
 
     def pause(self):
         with self.pause_cond:
@@ -380,13 +401,24 @@ FILE_NOTIFY_CHANGE_STREAM_WRITE = 0x00000800
 class MonitorThread(threading.Thread):
     """
     Monitors a directory for changes and processes changed files concurrently.
+    Also, periodically scans all running processes using psutil.
+    Uses a hash cache (with locking) to avoid re-processing files whose scan results
+    have already been determined.
     """
-    def __init__(self, monitor_folder, queue, max_workers=200):
+    def __init__(self, monitor_folder, queue, max_workers=200, process_scan_interval=30):
         threading.Thread.__init__(self)
         self.monitor_folder = monitor_folder
         self.queue = queue
         self.stop_event = threading.Event()
         self.max_workers = max_workers
+        self.process_scan_interval = process_scan_interval  # seconds between process scans
+
+        # Initialize a hash cache and a lock for thread-safety.
+        self.hash_cache = {}  # Format: { file_hash: risk_result }
+        self.cache_lock = threading.Lock()
+
+        # Timestamp for scheduling process scans.
+        self.last_process_scan_time = 0
 
     def run(self):
         if not os.path.exists(self.monitor_folder):
@@ -418,10 +450,11 @@ class MonitorThread(threading.Thread):
             FILE_NOTIFY_CHANGE_STREAM_WRITE
         )
 
-        # Create a ThreadPoolExecutor for processing file changes
+        # Use a ThreadPoolExecutor for processing file changes.
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             try:
                 while not self.stop_event.is_set():
+                    # Monitor file system changes.
                     results = win32file.ReadDirectoryChangesW(
                         hDir,
                         1024,
@@ -433,23 +466,42 @@ class MonitorThread(threading.Thread):
                     for action, file in results:
                         pathToScan = os.path.join(self.monitor_folder, file)
                         if os.path.exists(pathToScan):
-                            # Submit the scanning of this file in a separate thread.
+                            # Submit file scan in a separate thread.
                             executor.submit(self.process_changed_file, pathToScan)
                         else:
                             logging.warning("File not found: {}".format(pathToScan))
+
+                    # Periodically scan running processes.
+                    current_time = time.time()
+                    if current_time - self.last_process_scan_time >= self.process_scan_interval:
+                        self.last_process_scan_time = current_time
+                        executor.submit(self.scan_processes)
+
             except Exception as ex:
                 logging.error("Error in MonitorThread: {}".format(ex))
             finally:
                 win32file.CloseHandle(hDir)
 
     def process_changed_file(self, file_path):
-        # Use the same scanning logic as in ScanWorker's process_file
+        """
+        Process a file system change: compute its hash and query its risk status.
+        If malware is detected, quarantine the file.
+        """
         file_hash, file_data = calculate_file_hash(file_path)
         if not file_hash:
             return
-        risk_result = query_md5_online_sync(file_hash)
-        # Update the UI about the current file (if needed)
-        self.queue.put({'type': 'current_file', 'data': "{} -> {}".format(file_path, risk_result)})
+
+        # Check the hash cache.
+        with self.cache_lock:
+            if file_hash in self.hash_cache:
+                risk_result = self.hash_cache[file_hash]
+                self.queue.put({'type': 'current_file', 'data': "{} -> Cached Result".format(file_path)})
+            else:
+                risk_result = query_md5_online_sync(file_hash)
+                self.hash_cache[file_hash] = risk_result
+                self.queue.put({'type': 'current_file', 'data': "{} -> {}".format(file_path, risk_result)})
+
+        # If malware is detected, quarantine the file.
         if risk_result.startswith("Malware"):
             ensure_quarantine_folder()
             quarantine_path = os.path.join(QUARANTINE_FOLDER, os.path.basename(file_path))
@@ -461,6 +513,54 @@ class MonitorThread(threading.Thread):
             except Exception as e:
                 logging.error("Real-time: Failed to quarantine {}: {}".format(file_path, e))
             self.queue.put({'type': 'monitor_malware', 'data': (file_path, risk_result)})
+
+    def scan_processes(self):
+        """
+        Uses psutil to scan all running processes. For each process with an executable,
+        compute its hash and check its risk status using the shared hash cache.
+        If a process's executable is flagged as malware, notify the user.
+        """
+        processes = list(psutil.process_iter(['pid', 'name', 'exe']))
+        # Use a small ThreadPoolExecutor for process scanning.
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            for proc in processes:
+                executor.submit(self.scan_process, proc)
+
+    def scan_process(self, proc):
+        try:
+            exe_path = proc.info.get('exe')
+            # Skip processes with no executable path or non-existent files.
+            if not exe_path or not os.path.exists(exe_path):
+                return
+
+            file_hash, file_data = calculate_file_hash(exe_path)
+            if not file_hash:
+                msg = ("Process {} (PID: {}): Unable to compute hash for {}"
+                       .format(proc.info.get('name'), proc.info.get('pid'), exe_path))
+                self.queue.put({'type': 'process_scan', 'data': msg})
+                return
+
+            # Check the hash cache.
+            with self.cache_lock:
+                if file_hash in self.hash_cache:
+                    risk_result = self.hash_cache[file_hash]
+                else:
+                    risk_result = query_md5_online_sync(file_hash)
+                    self.hash_cache[file_hash] = risk_result
+
+            msg = ("Process: {} (PID: {}), Executable: {}\nRisk: {}"
+                   .format(proc.info.get('name'), proc.info.get('pid'), exe_path, risk_result))
+            self.queue.put({'type': 'process_scan', 'data': msg})
+
+            # If the process's executable is flagged as malware, notify the user.
+            if risk_result.startswith("Malware"):
+                notify_user(exe_path, risk_result)
+                self.queue.put({'type': 'process_malware', 'data': msg})
+
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            return
+        except Exception as e:
+            logging.error("Error scanning process {}: {}".format(proc, e))
 
     def stop(self):
         self.stop_event.set()
@@ -776,6 +876,7 @@ class MainApplication(tk.Tk):
             messagebox.showwarning("No Folder Selected", "Please select a folder first.")
             return
 
+        # Clear previous results
         self.malicious_list.delete(0, tk.END)
         self.clean_list.delete(0, tk.END)
         self.suspicious_list.delete(0, tk.END)
@@ -792,7 +893,7 @@ class MainApplication(tk.Tk):
         self.resume_scan_button.config(state=tk.DISABLED)
         self.open_quarantine_button.config(state=tk.DISABLED)
 
-        self.scan_thread = ScanWorker(self.selected_folder, self.queue)
+        self.scan_thread = ScanWorker(self.selected_folder, self.queue, self.hash_cache)
         self.scan_thread.start()
         logging.info("Scan started...")
 
