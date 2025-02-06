@@ -33,7 +33,7 @@ if not os.path.exists(log_directory):
 application_log_file = os.path.join(log_directory, "antivirus.log")
 logging.basicConfig(
     filename=application_log_file,
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
@@ -84,11 +84,12 @@ def query_md5_online_sync(md5_hash):
                 return "Benign (auto verdict)"
             if "this file is not yet rated" in lower_result:
                 return "Unknown"
-            return "Unknown (Result)"
+            return "Unknown"
         else:
             return "Unknown (API error)"
     except Exception as ex:
-        return "Error: {}".format(ex)
+        logging.error("Error querying MD5: %s", ex)  # Log only the error, not the URL
+        return "Unknown (exception)"
 
 def local_analysis(file_path, file_data):
     """Performs a local analysis of the file. Returns a string with the file name and type."""
@@ -359,11 +360,11 @@ class ScanWorker(threading.Thread):
 
         # Check if this file hash is already in our cache
         with self.cache_lock:
-            if exe_path in self.hash_cache:
-                risk_result = self.hash_cache[exe_path]
-                logging.info("Cache hit for process executable %s: %s", exe_path, risk_result)
-                self.queue.put({'type': 'process_scan', 'data': "Cached: {} -> {}".format(exe_path, risk_result)})
-                return
+            if file_hash in self.hash_cache:
+                cached_result = self.hash_cache[file_hash]
+                logging.info("Cache hit for file %s with hash %s", file_path, file_hash)
+                self.queue.put({'type': 'current_file', 'data': "{} -> Cached Result".format(file_path)})
+                return cached_result
 
         # Not in cache: perform the scan
         try:
@@ -618,8 +619,8 @@ class MonitorThread(threading.Thread):
     def scan_process(self, proc_info):
         """
         Scans a single process by computing its executable's hash and checking the risk.
-        Always submits a scan result (even for previously seen executables) but avoids
-        duplicating MD5 calculations and online queries.
+        Skips scanning files that have already been processed (using a hash cache).
+        The parameter proc_info is a dictionary containing process details.
         """
         try:
             exe_path = proc_info.get('exe')
@@ -633,52 +634,45 @@ class MonitorThread(threading.Thread):
                               proc_info.get('name'), proc_info.get('pid'), exe_path)
                 return
 
-            # Look up the executable path in the cache.
+            # Check if the file path is already in the cache.
             with self.cache_lock:
                 if exe_path in self.hash_cache:
-                    # Use the cached risk result (previous MD5 was already calculated).
                     risk_result = self.hash_cache[exe_path]
+                    logging.info("Cache hit for process executable %s: %s", exe_path, risk_result)
+                    self.queue.put({'type': 'process_scan', 'data': "Cached: {} -> {}".format(exe_path, risk_result)})
+                    return
+
+            logging.debug("Computing hash for process executable: %s", exe_path)
+            file_hash, file_data = calculate_file_hash(exe_path)
+            if not file_hash:
+                msg = ("Process {} (PID: {}): Unable to compute hash for {}"
+                       .format(proc_info.get('name'), proc_info.get('pid'), exe_path))
+                logging.warning(msg)
+                self.queue.put({'type': 'process_scan', 'data': msg})
+                return
+
+            # Check the hash cache.
+            with self.cache_lock:
+                if file_hash in self.hash_cache:
+                    risk_result = self.hash_cache[file_hash]
+                    logging.info("Cache hit for hash %s of executable %s", file_hash, exe_path)
                 else:
-                    # Compute the file's MD5 hash.
+                    logging.info("Cache miss for hash %s of executable %s; querying risk.", file_hash, exe_path)
                     try:
-                        file_hash, file_data = calculate_file_hash(exe_path)
+                        risk_result = query_md5_online_sync(file_hash)
                     except Exception as e:
-                        msg = ("Process {} (PID: {}): Error calculating hash for {}"
-                               .format(proc_info.get('name'), proc_info.get('pid'), exe_path))
-                        logging.error(msg + ": %s", e)
-                        self.queue.put({'type': 'process_scan', 'data': msg})
+                        logging.error("Error querying online for process %s: %s", exe_path, e)
                         return
-
-                    if not file_hash:
-                        msg = ("Process {} (PID: {}): Unable to compute hash for {}"
-                               .format(proc_info.get('name'), proc_info.get('pid'), exe_path))
-                        logging.warning(msg)
-                        self.queue.put({'type': 'process_scan', 'data': msg})
-                        return
-
-                    # Check if the hash itself is already cached.
-                    if file_hash in self.hash_cache:
-                        risk_result = self.hash_cache[file_hash]
-                    else:
-                        logging.info("Cache miss for hash %s of executable %s; querying risk.", file_hash, exe_path)
-                        try:
-                            risk_result = query_md5_online_sync(file_hash)
-                        except Exception as e:
-                            logging.error("Error querying online for process %s: %s", exe_path, e)
-                            return
-                        # Cache the MD5 hash result.
-                        self.hash_cache[file_hash] = risk_result
-
-                    # Also cache the executable path so we don’t recalc in the future.
+                    # Cache both the hash and the file path.
+                    self.hash_cache[file_hash] = risk_result
                     self.hash_cache[exe_path] = risk_result
 
-            # Always generate and send the process scan message.
             msg = ("Process: {} (PID: {}), Executable: {}\nRisk: {}"
                    .format(proc_info.get('name'), proc_info.get('pid'), exe_path, risk_result))
             logging.info("Process scan result: %s", msg)
             self.queue.put({'type': 'process_scan', 'data': msg})
 
-            # Notify and add extra info if the result is malware or suspicious.
+            # Notify user for malware or suspicious processes.
             if risk_result.startswith("Malware"):
                 logging.warning("Malware detected in process executable: %s", exe_path)
                 notify_user(exe_path, risk_result)
@@ -687,9 +681,9 @@ class MonitorThread(threading.Thread):
                 logging.warning("Suspicious result detected in process executable: %s", exe_path)
                 notify_user(exe_path, risk_result)
                 self.queue.put({'type': 'process_suspicious', 'data': msg})
-
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as specific_ex:
             logging.debug("Process scanning skipped due to process exception: %s", specific_ex)
+            return
         except Exception as e:
             logging.error("Error scanning process %s: %s", proc_info, e)
 
@@ -1144,6 +1138,7 @@ class MainApplication(tk.Tk):
                 msg = self.queue.get_nowait()
                 mtype = msg.get("type")
                 data = msg.get("data")
+                logging.debug("Processing queue message: %s with data: %s", mtype, data)
                 if mtype == "update_malicious":
                     self.count_malicious += 1
                     self.malicious_list.insert(tk.END, data)
