@@ -592,31 +592,31 @@ class MonitorThread(threading.Thread):
         else:
             logging.debug("File %s is clean: %s", file_path, risk_result)
 
-        def scan_processes(self):
-            """
-            Always scan all running processes using psutil, but skip scanning
-            files (executables) that have already been scanned.
-            """
-            logging.info("Starting scan of running processes.")
-            try:
-                processes = list(psutil.process_iter())
-            except Exception as e:
-                logging.error("Failed to retrieve processes: %s", e)
-                return
+    def scan_processes(self):
+        """
+        Always scan all running processes using psutil, but skip scanning
+        files (executables) that have already been scanned.
+        """
+        logging.info("Starting scan of running processes.")
+        try:
+            processes = list(psutil.process_iter())
+        except Exception as e:
+            logging.error("Failed to retrieve processes: %s", e)
+            return
 
-            # Use ThreadPoolExecutor for process scanning.
-            with ThreadPoolExecutor(max_workers=200) as executor:
-                for proc in processes:
-                    try:
-                        proc_info = proc.as_dict(attrs=['pid', 'name', 'exe'])
-                        logging.debug("Submitting scan for process: %s (PID: %s)", proc_info.get('name'),
-                                      proc_info.get('pid'))
-                        executor.submit(self.scan_process, proc)
-                    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as e:
-                        logging.debug("Skipping process due to error: %s", e)
-                    except Exception as e:
-                        logging.error("Error retrieving process info: %s", e)
-            logging.info("Completed submission of process scan tasks.")
+        # Use ThreadPoolExecutor for process scanning.
+        with ThreadPoolExecutor(max_workers=200) as executor:
+            for proc in processes:
+                try:
+                    proc_info = proc.as_dict(attrs=['pid', 'name', 'exe'])
+                    logging.debug("Submitting scan for process: %s (PID: %s)", proc_info.get('name'),
+                                  proc_info.get('pid'))
+                    executor.submit(self.scan_process, proc)
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as e:
+                    logging.debug("Skipping process due to error: %s", e)
+                except Exception as e:
+                    logging.error("Error retrieving process info: %s", e)
+        logging.info("Completed submission of process scan tasks.")
 
     def scan_process(self, proc):
         """
